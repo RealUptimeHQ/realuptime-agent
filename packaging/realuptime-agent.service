@@ -1,0 +1,24 @@
+[Unit]
+Description=RealUptime Monitor agent
+Documentation=https://docs.realuptime.io/monitor-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# /etc/realuptime-agent/env holds REALUPTIME_TOKEN (and optionally
+# REALUPTIME_URL, REALUPTIME_CLUSTER, REALUPTIME_NODE); root:root 0600.
+EnvironmentFile=/etc/realuptime-agent/env
+ExecStart=/usr/bin/node /opt/realuptime-agent/dist/agent.js
+User=realuptime-agent
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  // The shipped image must not carry the test suite or the vitest config, so
+  // the emit config narrows what the typecheck config deliberately includes.
+  "exclude": ["*.test.ts", "vitest.config.ts"]
+}

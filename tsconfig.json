@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    // NodeNext (not Bundler, which apps/mcp and apps/probe use) because this
+    // package is the only one in the repo that EMITS: customers run
+    // `node dist/agent.js`, not `node --experimental-strip-types index.ts`,
+    // so the output has to be real Node ESM with explicit extensions.
+    // `rewriteRelativeImportExtensions` lets the source keep the repo-wide
+    // `./thing.ts` import style while emitting `./thing.js`.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    "types": ["node"]
+  },
+  "include": ["*.ts"]
+}

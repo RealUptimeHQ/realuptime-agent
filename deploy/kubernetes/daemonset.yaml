@@ -1,0 +1,120 @@
+# RealUptime Monitor agent as a Kubernetes DaemonSet (REA-181).
+#
+# One agent pod per node, reporting the NODE's health (not the pod's): the
+# node's root filesystem is mounted read-only at /host, and the agent reads
+# /host/proc, /host/sys and /host/run when it finds /host/proc/stat, reporting
+# vantage "host" with detail "host-mount". hostPID and hostNetwork make the
+# host's process table and /proc/net the ones the agent sees; without them it
+# would truthfully report the pod's own, which is not what a cluster view is
+# for.
+#
+# ## Tokens: one agent registration per node
+#
+# A RealUptime agent token identifies ONE reporting host (two collectors on
+# one token interleave and the server flags it). A DaemonSet runs identical
+# pods, so the token cannot be a single Secret key. The pattern here: one
+# Secret, one key PER NODE NAME, mounted as files, and the agent told which
+# file to read through REALUPTIME_TOKEN_FILE=/etc/realuptime/tokens/$(NODE_NAME)
+# (Kubernetes expands $(NODE_NAME) from the downward-API variable above it).
+#
+#   kubectl -n realuptime create secret generic realuptime-agent-tokens \
+#     --from-literal=node-a=rua_... --from-literal=node-b=rua_... --from-literal=node-c=rua_...
+#
+# Register one agent per node in Monitor settings (name it after the node) and
+# paste each token under that node's name. A node whose name has no key in the
+# Secret starts, fails to read its token file, and exits with a clear log line
+# (it never guesses another node's token). Adding a node = adding a key.
+#
+# ## Labels
+#
+# REALUPTIME_CLUSTER is the label the dashboard's cluster view groups hosts
+# by; set it once per cluster below. REALUPTIME_NODE comes from the node
+# name.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: realuptime
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: realuptime-agent
+  namespace: realuptime
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: realuptime-agent
+  namespace: realuptime
+  labels:
+    app.kubernetes.io/name: realuptime-agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: realuptime-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: realuptime-agent
+    spec:
+      serviceAccountName: realuptime-agent
+      automountServiceAccountToken: false
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        # Run on control-plane nodes too; a cluster view that skips them is
+        # a partial one.
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: agent
+          image: ghcr.io/realuptimehq/agent:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: REALUPTIME_TOKEN_FILE
+              value: /etc/realuptime/tokens/$(NODE_NAME)
+            - name: REALUPTIME_NODE
+              value: $(NODE_NAME)
+            - name: REALUPTIME_CLUSTER
+              value: "my-cluster"  # <- set this; it is the dashboard's grouping label
+            # - name: REALUPTIME_URL
+            #   value: https://realuptime.io
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+            - name: tokens
+              mountPath: /etc/realuptime/tokens
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+        - name: tokens
+          secret:
+            secretName: realuptime-agent-tokens
+            defaultMode: 0400
