@@ -1,6 +1,17 @@
 import { AuthError, VantageConflictError, type AgentApi } from "./api.ts";
+import {
+  capAssignedChecks,
+  DEFAULT_BOUNDS,
+  logProbeBudgetExceeded,
+  mapWithConcurrency,
+  probeBudgetExceededMessage,
+  ProbeBudget,
+  type AgentBounds,
+} from "./bounds.ts";
 import { FLUSH_BATCH_SIZE, ResultBuffer } from "./buffer.ts";
 import { MetricsCollector, type MetricsCollectorOptions } from "./collect-metrics.ts";
+import type { EgressGuard } from "./egress-guard.ts";
+import { EgressReport } from "./egress-guard.ts";
 import { executeCheck } from "./execute.ts";
 import { log } from "./log.ts";
 import { METRICS_FLUSH_BATCH_SIZE, MetricsBuffer } from "./metrics-buffer.ts";
@@ -64,27 +75,47 @@ export interface MetricsSource {
   hostInfo?(): Promise<HostInfo | null> | HostInfo | null;
   /** Optional, v2: the opt-in service watch list from the last poll. */
   setServiceWatch?(names: readonly unknown[]): void;
+  /** REA-440, log snapshots phase 1: the last poll carried
+   *  `requestLogSnapshot: true`, so the very next `collect()` should
+   *  capture one. */
+  requestLogSnapshot?(): void;
 }
 
 export interface RuntimeDeps {
   api: AgentApi;
   now?: () => number;
-  execute?: (check: AgentCheck) => Promise<CheckResult>;
+  execute?: (check: AgentCheck, egress?: EgressGuard) => Promise<CheckResult>;
   buffer?: ResultBuffer;
   scheduler?: Scheduler;
   metricsBuffer?: MetricsBuffer;
   metricsSource?: MetricsSource;
   metricsOptions?: MetricsCollectorOptions;
+  /** The four load bounds this location enforces
+   * (`docs/private-probe-locations.md` section 3.4). Defaults to
+   * `DEFAULT_BOUNDS`; `agent.ts` passes what `loadBounds()` read from this
+   * machine's environment. */
+  bounds?: AgentBounds;
+  /** The egress policy (section 3.3), already bound to a report. Omitted
+   * means the pre-guard behaviour, which is what every existing runtime test
+   * exercises. */
+  egress?: EgressGuard;
+  /** Where the guard's counts land, drained onto the poll line once a minute.
+   * Supplied together with `egress` in production. */
+  egressReport?: EgressReport;
 }
 
 export class AgentRuntime {
   readonly buffer: ResultBuffer;
   readonly scheduler: Scheduler;
   readonly metricsBuffer: MetricsBuffer;
+  readonly bounds: AgentBounds;
   private readonly api: AgentApi;
   private readonly now: () => number;
-  private readonly execute: (check: AgentCheck) => Promise<CheckResult>;
+  private readonly execute: (check: AgentCheck, egress?: EgressGuard) => Promise<CheckResult>;
   private readonly metricsSource: MetricsSource;
+  private readonly egress?: EgressGuard;
+  private readonly egressReport: EgressReport;
+  private readonly probeBudget: ProbeBudget;
 
   private nextPollAt = 0;
   private nextFlushAt = 0;
@@ -105,9 +136,13 @@ export class AgentRuntime {
     this.now = deps.now ?? Date.now;
     this.execute = deps.execute ?? executeCheck;
     this.buffer = deps.buffer ?? new ResultBuffer();
-    this.scheduler = deps.scheduler ?? new Scheduler();
+    this.bounds = deps.bounds ?? DEFAULT_BOUNDS;
+    this.scheduler = deps.scheduler ?? new Scheduler(this.bounds.minIntervalSeconds);
     this.metricsBuffer = deps.metricsBuffer ?? new MetricsBuffer();
     this.metricsSource = deps.metricsSource ?? new MetricsCollector(deps.metricsOptions);
+    this.egress = deps.egress;
+    this.egressReport = deps.egressReport ?? new EgressReport();
+    this.probeBudget = new ProbeBudget(this.bounds.maxProbesPerMinute);
   }
 
   async tick(): Promise<void> {
@@ -163,16 +198,55 @@ export class AgentRuntime {
 
   private async pollOnce(now: number): Promise<void> {
     try {
-      const { checks, services } = await this.api.poll();
+      const { checks: assigned, services, requestLogSnapshot } = await this.api.poll();
+      // The assigned-check ceiling (section 3.4). Truncated rather than
+      // refused whole: a location running 250 of 300 assigned checks is
+      // monitoring 250 things, and one that refuses the list is monitoring
+      // nothing. Loud either way.
+      const { checks, dropped } = capAssignedChecks(assigned, this.bounds);
+      if (dropped > 0) {
+        log("warn", "assigned more checks than this location accepts", {
+          assigned: assigned.length,
+          running: checks.length,
+          dropped,
+          maxAssignedChecks: this.bounds.maxAssignedChecks,
+          hint: "split the monitors across more locations, or raise REALUPTIME_MAX_ASSIGNED_CHECKS on this host",
+        });
+      }
+      const clampedByFloor = this.scheduler.clampedByFloor(checks);
       this.scheduler.sync(checks, now);
       // The one server-pushed setting that reaches the collector: the
       // opt-in service watch list (protocol v2). Applied on every successful
       // poll so an operator's change in the dashboard lands within a minute
       // and a removed name stops being read.
       this.metricsSource.setServiceWatch?.(services);
+      // REA-440, log snapshots phase 1: the second (and last) server-pushed
+      // signal, a one-shot "capture on your next tick" flag rather than a
+      // persistent setting. Only ever arms the collector; never disarms it
+      // early, since a missed capture window is cheaper than one that never
+      // fires because a later poll raced it.
+      if (requestLogSnapshot) this.metricsSource.requestLogSnapshot?.();
       this.pollBackoffMs = 0;
       this.nextPollAt = now + POLL_INTERVAL_MS;
-      log("info", "polled", { checks: checks.length, services: services.length || undefined });
+      // The location's own health line. There is no local API and no local
+      // database to put any of this in (section 7 forbids both), so the log
+      // stream is the health surface, and everything a bound did in the last
+      // minute is on it: the egress verdicts, the clamped cadences, the
+      // truncated list.
+      const egress = this.egressReport.drain();
+      log("info", "polled", {
+        checks: checks.length,
+        services: services.length || undefined,
+        // Only present when non-zero, the same convention "flushed" uses, so a
+        // grep for one of these finds a real bound biting and not routine
+        // noise.
+        clampedToFloor: clampedByFloor > 0 ? clampedByFloor : undefined,
+        minIntervalSeconds: clampedByFloor > 0 ? this.bounds.minIntervalSeconds : undefined,
+        droppedOverCeiling: dropped > 0 ? dropped : undefined,
+        egressRefused: egress.refused > 0 ? egress.refused : undefined,
+        egressWouldRefuse: egress.wouldRefuse > 0 ? egress.wouldRefuse : undefined,
+        egressByRule: egress.refused + egress.wouldRefuse > 0 ? egress.byRule : undefined,
+      });
     } catch (err) {
       if (err instanceof AuthError) {
         this.nextPollAt = now + AUTH_RETRY_MS;
@@ -191,14 +265,46 @@ export class AgentRuntime {
     }
   }
 
+  /**
+   * Run whatever is due, inside this location's two load bounds.
+   *
+   * Concurrent because a tick's worth of checks must finish inside a tick, and
+   * each one can legitimately spend 10 seconds waiting on a dead target.
+   * Serialising them would make a handful of slow targets delay everything
+   * else on the machine. Bounded because a check list is a work order and an
+   * unbounded work order is a load generator pointed at infrastructure the
+   * customer may not have sized for it (section 3.4).
+   *
+   * The probe budget is spent BEFORE the concurrency ceiling queues anything,
+   * so "which checks were skipped" is decided by the order the server assigned
+   * them rather than by which target happened to answer fastest. A skipped
+   * check gets a synthetic FAILED result rather than nothing at all: silence
+   * would read as "not due yet" on the dashboard and the customer would have
+   * no way to learn the location is over capacity.
+   */
   private async runDue(now: number): Promise<void> {
     const due = this.scheduler.takeDue(now);
     if (due.length === 0) return;
-    // Concurrent because a tick's worth of checks must finish inside a tick,
-    // and each one can legitimately spend 10 seconds waiting on a dead target.
-    // Serialising them would make a handful of slow targets delay everything
-    // else on the machine.
-    const results = await Promise.all(due.map((check) => this.execute(check)));
+
+    const admitted: AgentCheck[] = [];
+    const skipped: AgentCheck[] = [];
+    for (const check of due) {
+      if (this.probeBudget.tryConsume(now)) admitted.push(check);
+      else skipped.push(check);
+    }
+
+    if (skipped.length > 0) {
+      logProbeBudgetExceeded(skipped.length, this.bounds);
+      const checkedAt = new Date(now).toISOString();
+      const message = probeBudgetExceededMessage(this.bounds);
+      for (const check of skipped) {
+        this.buffer.push({ checkId: check.id, ok: false, error: message, checkedAt });
+      }
+    }
+
+    const results = await mapWithConcurrency(admitted, this.bounds.maxConcurrentProbes, (check) =>
+      this.execute(check, this.egress),
+    );
     for (const result of results) this.buffer.push(result);
   }
 

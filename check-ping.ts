@@ -1,4 +1,5 @@
 import { runTcpCheck } from "./check-tcp.ts";
+import type { EgressGuard } from "./egress-guard.ts";
 
 /**
  * The ping check, agent side (REA-281).
@@ -36,7 +37,32 @@ export async function runPingCheck(
   host: string,
   count: number = DEFAULT_PING_COUNT,
   timeoutMs?: number,
+  egress?: EgressGuard,
 ): Promise<PingOutcome> {
+  // The guard runs ONCE for the whole probe, not once per attempt: this
+  // function makes up to twelve connections to one host, and twelve DNS
+  // lookups and twelve identical verdicts would buy nothing. The decision is
+  // then replayed to every attempt, so all of them stay pinned to the
+  // addresses that one lookup approved.
+  //
+  // Judged with a null port on purpose. The candidate ports below are this
+  // prober's own transport detail, not a target the customer chose, so
+  // REALUPTIME_ALLOW_PORTS (which is a statement about which of THEIR services
+  // may be probed) must not be applied to them. The address rules, which are
+  // the ones that matter, apply in full.
+  const decision = egress ? await egress(host, null) : null;
+  if (decision && !decision.proceed) {
+    return {
+      ok: false,
+      latencyMs: 0,
+      error: decision.error,
+      transport: PING_TRANSPORT,
+      port: null,
+      packetLossPercent: 100,
+    };
+  }
+  const pinned: EgressGuard | undefined = decision ? async () => decision : undefined;
+
   let port: number | null = null;
   let received = 0;
   let sent = 0;
@@ -46,7 +72,7 @@ export async function runPingCheck(
     const portsToTry: readonly number[] = port !== null ? [port] : CANDIDATE_PORTS;
     for (const candidate of portsToTry) {
       sent += 1;
-      const out = await runTcpCheck(host, candidate, false, timeoutMs);
+      const out = await runTcpCheck(host, candidate, false, timeoutMs, pinned);
       if (out.ok) {
         port = candidate;
         latencies.push(out.latencyMs);

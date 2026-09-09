@@ -80,3 +80,43 @@ describe("runTcpCheck", () => {
     expect(out.error).toBeDefined();
   });
 });
+
+describe("runTcpCheck: the egress guard", () => {
+  it("does not open a socket at all when the guard refuses", async () => {
+    const port = await listenTcp();
+    let dialed = false;
+    const out = await runTcpCheck("127.0.0.1", port, false, 5_000, async () => {
+      dialed = true;
+      return { proceed: false, error: "Blocked by this location's local policy (public address)", addresses: [] };
+    });
+    expect(dialed).toBe(true); // the guard ran
+    expect(out.ok).toBe(false);
+    expect(out.error).toBe("Blocked by this location's local policy (public address)");
+  });
+
+  it("connects to the address the guard pinned, not to whatever the name resolves to", async () => {
+    // The rebinding close: the socket is handed a lookup that replays the
+    // approved answer and never consults DNS, so a name that has since moved
+    // cannot take the connection with it.
+    const port = await listenTcp();
+    const out = await runTcpCheck("host-that-does-not-resolve.invalid", port, false, 5_000, async () => ({
+      proceed: true,
+      addresses: [{ address: "127.0.0.1", family: 4 }],
+    }));
+    expect(out.ok).toBe(true);
+  });
+
+  it("pins the TLS path too, with SNI still derived from the name", async () => {
+    const port = await listenTls();
+    const out = await runTcpCheck("host-that-does-not-resolve.invalid", port, true, 5_000, async () => ({
+      proceed: true,
+      addresses: [{ address: "127.0.0.1", family: 4 }],
+    }));
+    expect(out.ok).toBe(true);
+  });
+
+  it("without a guard, behaves exactly as it did before one existed", async () => {
+    const port = await listenTcp();
+    expect((await runTcpCheck("127.0.0.1", port, false)).ok).toBe(true);
+  });
+});

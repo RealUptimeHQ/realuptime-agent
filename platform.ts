@@ -26,7 +26,19 @@ import type { HostOs } from "./types.ts";
  *    command, and nothing the server sends is ever passed as an argument.
  *    The service watch list is filtered in this process AFTER a command
  *    listing ALL services returns, precisely so no operator-typed name ever
- *    reaches a command line. On Linux no command is run at all.
+ *    reaches a command line.
+ *
+ *    On Linux every metric reading still comes from `/proc`/`/sys` alone --
+ *    no command is run for CPU, memory, disk, network, processes or
+ *    containers. `journalctl` and `docker` are the ONE exception (REA-440,
+ *    log snapshots phase 1), and only when a customer has explicitly opted
+ *    a source in (`REALUPTIME_LOG_UNITS` / `REALUPTIME_LOG_DOCKER_ENABLED`,
+ *    off by default) AND the server has asked for a snapshot right now
+ *    (see collect-logs.ts, types.ts's `PollResponse.requestLogSnapshot`).
+ *    Every argument is either a fixed flag or a value that already passed
+ *    `safePathSegment` (a systemd unit name from local config, or a
+ *    container id this agent already discovered via cgroup/Docker socket
+ *    reads); nothing the server sends ever reaches this argv either.
  *
  * `ALLOWED_COMMANDS` is the closed set; `exec` refuses anything else. A new
  * entry is a design decision made in this file, not an npm install.
@@ -71,7 +83,10 @@ export interface HostPlatform {
 export const ALLOWED_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   darwin: ["vm_stat", "df", "netstat", "ps", "launchctl", "sw_vers"],
   windows: ["powershell.exe", "wmic"],
-  linux: [],
+  // REA-440, log snapshots phase 1: the only commands ever run on Linux,
+  // and only opt-in and only on an explicit snapshot request. See the class
+  // doc comment above and collect-logs.ts.
+  linux: ["journalctl", "docker"],
   other: [],
 };
 

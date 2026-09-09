@@ -45,7 +45,12 @@
 .PARAMETER Node
   Optional node label (REALUPTIME_NODE); defaults to the computer name.
 .PARAMETER Version
-  Pin a release (default: latest).
+  Pin a release (default: latest, or REALUPTIME_AGENT_VERSION). The tag is
+  resolved from the public mirror repository's own releases via the GitHub
+  API, filtered to agent-* tags (REA-601).
+.PARAMETER PrintVersion
+  Resolve and print the release tag this run would install, then exit; no
+  token needed, nothing installed.
 .PARAMETER Uninstall
   Stop and remove the task and the install directory.
 #>
@@ -55,14 +60,19 @@ param(
   [string] $Url = $env:REALUPTIME_URL,
   [string] $Cluster = $env:REALUPTIME_CLUSTER,
   [string] $Node = $env:REALUPTIME_NODE,
-  [string] $Version = "latest",
+  [string] $Version = $(if ($env:REALUPTIME_AGENT_VERSION) { $env:REALUPTIME_AGENT_VERSION } else { "latest" }),
+  [switch] $PrintVersion,
   [switch] $Uninstall
 )
 
 $ErrorActionPreference = "Stop"
 $TaskName = "RealUptime Agent"
 $InstallDir = Join-Path $env:ProgramFiles "RealUptime Agent"
-$ReleaseBase = if ($env:REALUPTIME_RELEASE_BASE) { $env:REALUPTIME_RELEASE_BASE } else { "https://github.com/realuptimehq/realuptime/releases/download" }
+# The public mirror of apps/agent (scripts/publish-agent-mirror.mjs) --
+# releases live HERE, not on the private monorepo (REA-601).
+$MirrorRepo = "realuptimehq/realuptime-agent"
+$ReleaseBase = if ($env:REALUPTIME_RELEASE_BASE) { $env:REALUPTIME_RELEASE_BASE } else { "https://github.com/$MirrorRepo/releases/download" }
+$MirrorApiBase = if ($env:REALUPTIME_AGENT_API_BASE) { $env:REALUPTIME_AGENT_API_BASE } else { "https://api.github.com/repos/$MirrorRepo" }
 
 function Assert-Admin {
   $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
@@ -83,12 +93,23 @@ function Uninstall-RealUptimeAgent {
 
 function Resolve-ReleaseTag([string] $RequestedVersion) {
   if ($RequestedVersion -ne "latest") { return "agent-$RequestedVersion" }
-  $response = Invoke-WebRequest -UseBasicParsing -MaximumRedirection 0 -ErrorAction SilentlyContinue `
-    -Uri "https://github.com/realuptimehq/realuptime/releases/latest"
-  $location = $response.Headers["Location"]
-  if (-not $location) { throw "could not resolve the latest agent release; pass -Version" }
-  $tag = ($location -split "/")[-1]
-  if ($tag -notlike "agent-*") { throw "latest release '$tag' is not an agent release; pass -Version" }
+  # REA-601: this used to hit https://github.com/realuptimehq/realuptime/
+  # releases/latest and read the tag off the redirect's Location header.
+  # That repository is the private monorepo: an anonymous request gets a
+  # bare 404, never a redirect, so this always failed. The public mirror's
+  # own release list, read through the GitHub REST API and filtered to
+  # agent-* tags, is the only anonymous-reachable source of "what is the
+  # latest agent release" -- same fix, same reasoning, as
+  # apps/agent/install/install.sh's resolve_agent_tag on Linux.
+  try {
+    $releases = Invoke-RestMethod -UseBasicParsing -Uri "$MirrorApiBase/releases"
+  } catch {
+    throw "could not reach $MirrorApiBase/releases to resolve the latest agent release; pass -Version or set REALUPTIME_AGENT_VERSION"
+  }
+  $tag = ($releases | Where-Object { $_.tag_name -like "agent-*" } | Select-Object -First 1).tag_name
+  if (-not $tag) {
+    throw "could not resolve the latest agent release tag from $MirrorApiBase/releases (no agent-* release found there); pass -Version or set REALUPTIME_AGENT_VERSION"
+  }
   return $tag
 }
 
@@ -164,4 +185,10 @@ exit $LASTEXITCODE
   Write-Host "done. Get-ScheduledTask '$TaskName' shows the agent; it appears in the dashboard within a minute."
 }
 
-if ($Uninstall) { Uninstall-RealUptimeAgent } elseif ($MyInvocation.InvocationName -ne ".") { Install-RealUptimeAgent }
+if ($Uninstall) {
+  Uninstall-RealUptimeAgent
+} elseif ($PrintVersion) {
+  Write-Output (Resolve-ReleaseTag $Version)
+} elseif ($MyInvocation.InvocationName -ne ".") {
+  Install-RealUptimeAgent
+}

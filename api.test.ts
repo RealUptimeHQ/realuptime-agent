@@ -1,10 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { ApiClient, AuthError, TransientError, VantageConflictError, parseChecks, parseServiceWatch } from "./api.ts";
+import {
+  ApiClient,
+  AuthError,
+  TransientError,
+  VantageConflictError,
+  parseChecks,
+  parseRequestLogSnapshot,
+  parseRules,
+  parseServiceWatch,
+} from "./api.ts";
 import { FLUSH_BATCH_SIZE } from "./buffer.ts";
 import { METRICS_FLUSH_BATCH_SIZE } from "./metrics-buffer.ts";
+import type { AgentConfig } from "./config.ts";
 import type { CheckResult, MetricSample, MetricsRequest } from "./types.ts";
 
-const config = { token: "rua_test_token", baseUrl: "https://realuptime.io", cluster: null, node: null };
+const config: AgentConfig = {
+  token: "rua_test_token",
+  baseUrl: "https://realuptime.io",
+  cluster: null,
+  node: null,
+  postgresDsn: null,
+  redisDsn: null,
+  mysqlDsn: null,
+  gpuVendor: "nvidia",
+  logUnits: [],
+  logDockerEnabled: false,
+  logLines: 50,
+};
 
 function stub(status: number, body: unknown = {}): typeof fetch {
   return (async () =>
@@ -58,7 +80,8 @@ describe("ApiClient", () => {
   });
 
   it("treats a 200 with an unreadable body as transient", async () => {
-    const fetchImpl = (async () => new Response("not json", { status: 200 })) as unknown as typeof fetch;
+    const fetchImpl = (async () =>
+      new Response("not json", { status: 200 })) as unknown as typeof fetch;
     await expect(new ApiClient(config, fetchImpl).poll()).rejects.toBeInstanceOf(TransientError);
   });
 
@@ -66,9 +89,7 @@ describe("ApiClient", () => {
     const client = new ApiClient(config, stub(200));
     const tooMany = Array.from({ length: FLUSH_BATCH_SIZE + 1 }, (_, i) => result(i));
     await expect(client.sendResults(tooMany)).rejects.toBeInstanceOf(TransientError);
-    await expect(
-      client.sendResults(tooMany.slice(0, FLUSH_BATCH_SIZE)),
-    ).resolves.toBeUndefined();
+    await expect(client.sendResults(tooMany.slice(0, FLUSH_BATCH_SIZE))).resolves.toBeUndefined();
   });
 });
 
@@ -103,7 +124,12 @@ describe("ApiClient.sendMetrics", () => {
 
     expect(calls[0]?.[0]).toBe("https://realuptime.io/api/agent/v1/metrics");
     expect(JSON.parse(String(calls[0]?.[1].body))).toEqual(metricsRequest([metricSample(1)]));
-    expect(response).toEqual({ accepted: 1, rejectedStale: 0, rejectedFuture: 0, rejectedDuplicate: 0 });
+    expect(response).toEqual({
+      accepted: 1,
+      rejectedStale: 0,
+      rejectedFuture: 0,
+      rejectedDuplicate: 0,
+    });
   });
 
   it("turns a 409 into VantageConflictError, carrying the server's message", async () => {
@@ -128,7 +154,10 @@ describe("ApiClient.sendMetrics", () => {
   });
 
   it("refuses to send more than the contract's 100 samples", async () => {
-    const client = new ApiClient(config, stub(200, { accepted: 0, rejectedStale: 0, rejectedFuture: 0, rejectedDuplicate: 0 }));
+    const client = new ApiClient(
+      config,
+      stub(200, { accepted: 0, rejectedStale: 0, rejectedFuture: 0, rejectedDuplicate: 0 }),
+    );
     const tooMany = metricsRequest(
       Array.from({ length: METRICS_FLUSH_BATCH_SIZE + 1 }, (_, i) => metricSample(i)),
     );
@@ -207,11 +236,119 @@ describe("parseChecks", () => {
   });
 });
 
+/**
+ * The closed operation vocabulary, section 3.2 of
+ * `docs/private-probe-locations.md`.
+ *
+ * The point of these is not that a malformed value is rejected. It is that a
+ * value the server INVENTED cannot reach a dialer. An old agent facing a
+ * server that learned a new verb has to refuse the verb, because that property
+ * is what stops a compromised server teaching a deployed agent a capability it
+ * was never compiled with.
+ */
+describe("parseChecks: the closed vocabulary", () => {
+  it("holds exactly the four probe verbs and the six dns record types", () => {
+    expect([...parseRules.checkTypes]).toEqual(["http", "tcp", "dns", "ping"]);
+    // Byte-identical to the server's own z.enum in packages/db/api-schemas.ts.
+    expect([...parseRules.dnsRecordTypes]).toEqual(["A", "AAAA", "CNAME", "MX", "TXT", "NS"]);
+  });
+
+  it("refuses a dns record type that is not on the list", () => {
+    // ANY is resolveAny, the one query check-dns.ts's header says is never
+    // used. Without the allowlist the type arrives as an unconstrained string
+    // and goes straight to the resolver.
+    for (const recordType of ["ANY", "SOA", "PTR", "SRV", "CAA", "any", "a"]) {
+      const [c] = parseChecks({
+        checks: [
+          { id: "1", type: "dns", dnsHostname: "api.internal", dnsRecordType: recordType, intervalSeconds: 60 },
+        ],
+      });
+      expect(c?.dnsRecordType).toBeNull();
+    }
+  });
+
+  it("keeps every record type that IS on the list", () => {
+    for (const recordType of parseRules.dnsRecordTypes) {
+      const [c] = parseChecks({
+        checks: [
+          { id: "1", type: "dns", dnsHostname: "api.internal", dnsRecordType: recordType, intervalSeconds: 60 },
+        ],
+      });
+      expect(c?.dnsRecordType).toBe(recordType);
+    }
+  });
+
+  it("refuses a tcp port outside the real range, or one of the amplification ports", () => {
+    for (const port of [0, -1, 65_536, 1.5, 7, 9, 13, 17, 19]) {
+      const [c] = parseChecks({
+        checks: [{ id: "1", type: "tcp", tcpHost: "db.internal", tcpPort: port, intervalSeconds: 60 }],
+      });
+      expect(c?.tcpPort).toBeNull();
+    }
+  });
+
+  it("keeps an ordinary tcp port", () => {
+    for (const port of [1, 22, 5432, 65_535]) {
+      const [c] = parseChecks({
+        checks: [{ id: "1", type: "tcp", tcpHost: "db.internal", tcpPort: port, intervalSeconds: 60 }],
+      });
+      expect(c?.tcpPort).toBe(port);
+    }
+  });
+
+  /**
+   * MUTATION TEST. Widen the vocabulary and the refusals have to disappear.
+   * Without this, every assertion above would still pass if the allowlist were
+   * replaced by an unconditional `true`, because a made-up verb would simply
+   * be absent from the fixture's expectations.
+   */
+  it("mutation: with the vocabulary widened, the unknown verb is accepted", () => {
+    const originalTypes = parseRules.checkTypes;
+    const originalRecords = parseRules.dnsRecordTypes;
+    try {
+      parseRules.checkTypes = [...originalTypes, "quantum"];
+      const [invented] = parseChecks({ checks: [{ id: "1", type: "quantum", intervalSeconds: 60 }] });
+      expect(invented).toBeDefined();
+      expect(invented?.type).toBe("quantum");
+
+      parseRules.dnsRecordTypes = [...originalRecords, "ANY"];
+      const [any] = parseChecks({
+        checks: [{ id: "2", type: "dns", dnsHostname: "h.internal", dnsRecordType: "ANY", intervalSeconds: 60 }],
+      });
+      expect(any?.dnsRecordType).toBe("ANY");
+    } finally {
+      parseRules.checkTypes = originalTypes;
+      parseRules.dnsRecordTypes = originalRecords;
+    }
+  });
+
+  it("the vocabulary is restored afterwards", () => {
+    expect(parseChecks({ checks: [{ id: "1", type: "quantum", intervalSeconds: 60 }] })).toEqual([]);
+    const [c] = parseChecks({
+      checks: [{ id: "2", type: "dns", dnsHostname: "h.internal", dnsRecordType: "ANY", intervalSeconds: 60 }],
+    });
+    expect(c?.dnsRecordType).toBeNull();
+  });
+});
+
 describe("parseServiceWatch (protocol v2)", () => {
   it("reads the opt-in list, keeps only strings, and treats absence as nothing to watch", () => {
-    expect(parseServiceWatch({ checks: [], services: ["nginx", 3, null, "sshd"] })).toEqual(["nginx", "sshd"]);
+    expect(parseServiceWatch({ checks: [], services: ["nginx", 3, null, "sshd"] })).toEqual([
+      "nginx",
+      "sshd",
+    ]);
     expect(parseServiceWatch({ checks: [] })).toEqual([]);
     expect(parseServiceWatch({ checks: [], services: "nginx" })).toEqual([]);
     expect(parseServiceWatch(null)).toEqual([]);
+  });
+});
+
+describe("parseRequestLogSnapshot (REA-440, log snapshots phase 1)", () => {
+  it("is true only for the literal boolean true", () => {
+    expect(parseRequestLogSnapshot({ checks: [], requestLogSnapshot: true })).toBe(true);
+    expect(parseRequestLogSnapshot({ checks: [], requestLogSnapshot: false })).toBe(false);
+    expect(parseRequestLogSnapshot({ checks: [], requestLogSnapshot: "true" })).toBe(false);
+    expect(parseRequestLogSnapshot({ checks: [] })).toBe(false);
+    expect(parseRequestLogSnapshot(null)).toBe(false);
   });
 });

@@ -10,7 +10,14 @@ import { MAX_ASSERTION_BODY_BYTES } from "./http-assertions.ts";
 import { METRICS_FLUSH_BATCH_SIZE, metricsBufferPolicy } from "./metrics-buffer.ts";
 import { TICK_MS } from "./scheduler.ts";
 import { MAX_CONTAINERS_PER_SAMPLE } from "./collect-containers.ts";
+import {
+  LOG_SNAPSHOT_DEFAULT_LINES,
+  LOG_SNAPSHOT_MAX_LINE_BYTES,
+  LOG_SNAPSHOT_MAX_LINES,
+  LOG_SNAPSHOT_MAX_SOURCES,
+} from "./collect-logs.ts";
 import { MAX_NETWORK_INTERFACES_PER_SAMPLE } from "./collect-network.ts";
+import { MAX_POSTGRES_DATABASES_PER_SAMPLE } from "./collect-postgres.ts";
 import { MAX_PROCESSES_PER_SAMPLE } from "./collect-processes.ts";
 import { MAX_WATCHED_SERVICES } from "./collect-services.ts";
 import {
@@ -19,14 +26,21 @@ import {
   type CheckResult,
   type ContainerSample,
   type DiskSample,
+  type GpuReading,
+  type GpuUnavailable,
   type HostInfo,
+  type LogSnapshot,
   type MetricSample,
   type MetricsRequest,
   type MetricsResponse,
   type MetricsVantage,
+  type MysqlSample,
   type NetworkInterfaceSample,
   type PollResponse,
+  type PostgresDatabaseSample,
+  type PostgresSample,
   type ProcessSample,
+  type RedisSample,
   type ServiceSample,
 } from "./types.ts";
 
@@ -130,6 +144,43 @@ describe("wire contract", () => {
       processes: [],
       containers: [],
       services: [],
+      postgres: {
+        connections: 3,
+        maxConnections: 100,
+        databases: [],
+        cacheHitRatio: 0.9,
+        longestQuerySeconds: 0,
+        replicationLagSeconds: null,
+      },
+      redis: {
+        usedMemoryBytes: 1_000_000,
+        maxMemoryBytes: null,
+        connectedClients: 4,
+        hitRatio: 0.95,
+        evictedKeys: 0,
+      },
+      mysql: {
+        connections: 5,
+        maxConnections: 151,
+        threadsRunning: 1,
+        slowQueries: 0,
+        bufferPoolHitRatio: 0.99,
+        uptimeSeconds: 86_400,
+        replicationLagSeconds: null,
+      },
+      gpu: [
+        {
+          index: 0,
+          name: "NVIDIA A100-SXM4-40GB",
+          utilizationRatio: 0.45,
+          memoryUsedBytes: 2 * 1024 * 1024 * 1024,
+          memoryTotalBytes: 40 * 1024 * 1024 * 1024,
+          temperatureCelsius: 62,
+          powerDrawWatts: 150,
+          powerLimitWatts: 400,
+        },
+      ],
+      logs: [],
     };
     expect(Object.keys(sample).sort()).toEqual(
       [
@@ -137,13 +188,18 @@ describe("wire contract", () => {
         "cpuCores",
         "cpuUsedRatio",
         "filesystems",
+        "gpu",
         "load1",
         "load15",
         "load5",
+        "logs",
         "memoryTotalBytes",
         "memoryUsedBytes",
+        "mysql",
         "network",
+        "postgres",
         "processes",
+        "redis",
         "sampledAt",
         "services",
       ].sort(),
@@ -167,10 +223,22 @@ describe("wire contract", () => {
       txDropped: 0,
     };
     expect(Object.keys(net).sort()).toEqual(
-      ["name", "rxBytesPerSec", "rxDropped", "rxErrors", "txBytesPerSec", "txDropped", "txErrors"].sort(),
+      [
+        "name",
+        "rxBytesPerSec",
+        "rxDropped",
+        "rxErrors",
+        "txBytesPerSec",
+        "txDropped",
+        "txErrors",
+      ].sort(),
     );
     const proc: Required<ProcessSample> = { pid: 1, name: "node", cpuRatio: 0.1, memoryBytes: 100 };
     expect(Object.keys(proc).sort()).toEqual(["cpuRatio", "memoryBytes", "name", "pid"].sort());
+    // image/state/restartCount/health are REA-440 additions: optional so a
+    // pre-REA-440 agent (cgroup-only, no Docker socket enrichment) keeps
+    // sending exactly the six fields above and a pre-REA-440 server keeps
+    // ignoring whatever unknown fields show up on a newer agent's batch.
     const container: Required<ContainerSample> = {
       id: "abc",
       name: null,
@@ -178,9 +246,24 @@ describe("wire contract", () => {
       cpuRatio: null,
       memoryUsedBytes: 1,
       memoryLimitBytes: null,
+      image: "nginx:1.27",
+      state: "running",
+      restartCount: 0,
+      health: "none",
     };
     expect(Object.keys(container).sort()).toEqual(
-      ["cpuRatio", "id", "memoryLimitBytes", "memoryUsedBytes", "name", "runtime"].sort(),
+      [
+        "cpuRatio",
+        "health",
+        "id",
+        "image",
+        "memoryLimitBytes",
+        "memoryUsedBytes",
+        "name",
+        "restartCount",
+        "runtime",
+        "state",
+      ].sort(),
     );
     const service: Required<ServiceSample> = { name: "nginx", status: "active" };
     expect(Object.keys(service).sort()).toEqual(["name", "status"].sort());
@@ -192,9 +275,129 @@ describe("wire contract", () => {
       cluster: null,
       node: null,
     };
-    expect(Object.keys(host).sort()).toEqual(["arch", "cluster", "hostname", "node", "os", "osVersion"].sort());
-    const poll: Required<PollResponse> = { checks: [], services: [] };
-    expect(Object.keys(poll).sort()).toEqual(["checks", "services"]);
+    expect(Object.keys(host).sort()).toEqual(
+      ["arch", "cluster", "hostname", "node", "os", "osVersion"].sort(),
+    );
+    const poll: Required<PollResponse> = { checks: [], services: [], requestLogSnapshot: false };
+    expect(Object.keys(poll).sort()).toEqual(["checks", "requestLogSnapshot", "services"].sort());
+  });
+
+  // REA-440, log snapshots phase 1: a small, bounded, one-shot tail,
+  // present only when the server asked for one (PollResponse.
+  // requestLogSnapshot) and at least one opt-in source is configured.
+  it("names every field of the log snapshot family", () => {
+    const snapshot: Required<LogSnapshot> = {
+      source: "nginx",
+      sourceType: "journald",
+      capturedAt: new Date(0).toISOString(),
+      lines: ["one", "two"],
+      truncatedLines: false,
+      truncatedBytes: false,
+    };
+    expect(Object.keys(snapshot).sort()).toEqual(
+      ["capturedAt", "lines", "source", "sourceType", "truncatedBytes", "truncatedLines"].sort(),
+    );
+    const sourceTypes: LogSnapshot["sourceType"][] = ["journald", "docker"];
+    expect(sourceTypes).toEqual(["journald", "docker"]);
+  });
+
+  // REA-440 phase 3: config-gated, off by default. A single object, not an
+  // array like the four REA-181 families above, since one Postgres
+  // instance's health is one reading per sample, not a list of them.
+  it("names every field of the PostgreSQL family", () => {
+    const db: Required<PostgresDatabaseSample> = { name: "appdb", sizeBytes: 500_000_000 };
+    expect(Object.keys(db).sort()).toEqual(["name", "sizeBytes"].sort());
+
+    const pg: Required<PostgresSample> = {
+      connections: 3,
+      maxConnections: 100,
+      databases: [db],
+      cacheHitRatio: 0.97,
+      longestQuerySeconds: 4.2,
+      replicationLagSeconds: null,
+    };
+    expect(Object.keys(pg).sort()).toEqual(
+      [
+        "cacheHitRatio",
+        "connections",
+        "databases",
+        "longestQuerySeconds",
+        "maxConnections",
+        "replicationLagSeconds",
+      ].sort(),
+    );
+  });
+
+  // REA-440 phase 3, also config-gated and off by default, and also a
+  // single object rather than an array.
+  it("names every field of the Redis family", () => {
+    const redis: Required<RedisSample> = {
+      usedMemoryBytes: 1_000_000,
+      maxMemoryBytes: 536_870_912,
+      connectedClients: 4,
+      hitRatio: 0.95,
+      evictedKeys: 12,
+    };
+    expect(Object.keys(redis).sort()).toEqual(
+      ["connectedClients", "evictedKeys", "hitRatio", "maxMemoryBytes", "usedMemoryBytes"].sort(),
+    );
+  });
+
+  // REA-440 phase 4, also config-gated, off by default, and also a single
+  // object rather than an array, same shape as the two families above.
+  it("names every field of the MySQL family", () => {
+    const mysql: Required<MysqlSample> = {
+      connections: 5,
+      maxConnections: 151,
+      threadsRunning: 1,
+      slowQueries: 2,
+      bufferPoolHitRatio: 0.995,
+      uptimeSeconds: 86_400,
+      replicationLagSeconds: 0,
+    };
+    expect(Object.keys(mysql).sort()).toEqual(
+      [
+        "bufferPoolHitRatio",
+        "connections",
+        "maxConnections",
+        "replicationLagSeconds",
+        "slowQueries",
+        "threadsRunning",
+        "uptimeSeconds",
+      ].sort(),
+    );
+  });
+
+  // REA-440 phase 5. Unlike the three DB families above, this one is an
+  // array (a host can have more than one GPU) OR a `GpuUnavailable` object
+  // when nvidia-smi is present but this tick's reading failed, or the
+  // configured vendor is not implemented. Absent entirely means no NVIDIA
+  // driver was found at all.
+  it("names every field of the GPU family", () => {
+    const gpu: Required<GpuReading> = {
+      index: 0,
+      name: "NVIDIA A100-SXM4-40GB",
+      utilizationRatio: 0.45,
+      memoryUsedBytes: 2 * 1024 * 1024 * 1024,
+      memoryTotalBytes: 40 * 1024 * 1024 * 1024,
+      temperatureCelsius: 62,
+      powerDrawWatts: 150,
+      powerLimitWatts: 400,
+    };
+    expect(Object.keys(gpu).sort()).toEqual(
+      [
+        "index",
+        "memoryTotalBytes",
+        "memoryUsedBytes",
+        "name",
+        "powerDrawWatts",
+        "powerLimitWatts",
+        "temperatureCelsius",
+        "utilizationRatio",
+      ].sort(),
+    );
+    const unavailable: Required<GpuUnavailable> = { error: "nvidia-smi failed: timed out" };
+    expect(Object.keys(unavailable).sort()).toEqual(["error"]);
   });
 
   it("pins the protocol version and the v2 per-sample caps to the server's", () => {
@@ -203,6 +406,7 @@ describe("wire contract", () => {
     expect(MAX_PROCESSES_PER_SAMPLE).toBe(20);
     expect(MAX_CONTAINERS_PER_SAMPLE).toBe(64);
     expect(MAX_WATCHED_SERVICES).toBe(64);
+    expect(MAX_POSTGRES_DATABASES_PER_SAMPLE).toBe(20);
   });
 
   it("names every field of a filesystem reading", () => {
@@ -318,6 +522,17 @@ describe("wire contract", () => {
     expect(MAX_FILESYSTEMS_PER_SAMPLE).toBe(32);
   });
 
+  // REA-440, log snapshots phase 1: caps mirrored on the server
+  // (packages/db/server-metrics.ts's MAX_LOG_SOURCES_PER_SAMPLE /
+  // MAX_LOG_LINES_PER_SOURCE / MAX_LOG_LINE_BYTES), which re-enforces every
+  // one of these itself rather than trusting the agent's own limits.
+  it("pins the log snapshot caps to the server's", () => {
+    expect(LOG_SNAPSHOT_DEFAULT_LINES).toBe(50);
+    expect(LOG_SNAPSHOT_MAX_LINES).toBe(200);
+    expect(LOG_SNAPSHOT_MAX_LINE_BYTES).toBe(4096);
+    expect(LOG_SNAPSHOT_MAX_SOURCES).toBe(10);
+  });
+
   // Response assertions (Monitor Phase 4): this program's body-read cap
   // mirrors packages/checker/http-assertions.ts's MAX_ASSERTION_BODY_BYTES,
   // which is itself packages/db/outage-feed.ts's existing
@@ -359,12 +574,16 @@ describe("dependency hygiene", () => {
       "collect-cpu.ts",
       "collect-darwin.ts",
       "collect-disk.ts",
+      "collect-docker.ts",
       "collect-linux.ts",
+      "collect-logs.ts",
       "collect-load.ts",
       "collect-memory.ts",
       "collect-metrics.ts",
       "collect-network.ts",
+      "collect-postgres.ts",
       "collect-processes.ts",
+      "collect-redis.ts",
       "collect-services.ts",
       "collect-windows.ts",
       "config.ts",

@@ -57,10 +57,13 @@ export class VantageConflictError extends Error {
 }
 
 /** What one poll hands back: the checks, plus the opt-in service watch list
- * (protocol v2, REA-181; empty from a v1 server). */
+ * (protocol v2, REA-181; empty from a v1 server) and the one-shot log
+ * snapshot request (REA-440, log snapshots phase 1; false from a server
+ * that predates it or has no reason to ask right now). */
 export interface PollResult {
   checks: AgentCheck[];
   services: string[];
+  requestLogSnapshot: boolean;
 }
 
 export interface AgentApi {
@@ -80,7 +83,11 @@ export class ApiClient implements AgentApi {
 
   async poll(): Promise<PollResult> {
     const body = await this.post("/api/agent/v1/poll", {});
-    return { checks: parseChecks(body), services: parseServiceWatch(body) };
+    return {
+      checks: parseChecks(body),
+      services: parseServiceWatch(body),
+      requestLogSnapshot: parseRequestLogSnapshot(body),
+    };
   }
 
   async sendResults(results: CheckResult[]): Promise<void> {
@@ -163,7 +170,69 @@ export class ApiClient implements AgentApi {
   }
 }
 
-const CHECK_TYPES: readonly string[] = ["http", "tcp", "dns", "ping"];
+/**
+ * The closed operation vocabulary, agent side
+ * (`docs/private-probe-locations.md` section 3.2).
+ *
+ * The poll response is a DATA CONTRACT with a finite vocabulary, never a
+ * command channel, and this object is the third of the three places that
+ * vocabulary is enforced (the other two are the
+ * `checks_agent_id_probed_types` database constraint and the poll route's
+ * serializer, which builds its response from typed columns and cannot emit a
+ * field that has no column). Three enforcement points for one rule is
+ * deliberate: this is the property that makes an agent inside a customer's
+ * network defensible, and a property with a single enforcement point is one
+ * refactor from gone.
+ *
+ * The rule for the future, stated so it cannot be lost: **this parser is an
+ * allowlist and stays an allowlist.** No `switch` default that attempts a
+ * generic action, no pass-through of an unknown field into any dialer. An old
+ * agent facing a server that learned a new verb refuses the verb, which means
+ * a compromised server cannot teach a deployed agent a new capability, only
+ * reuse the ones it was compiled with.
+ *
+ * Behind a mutable holder so `api.test.ts` can widen it and watch the refusal
+ * assertions flip, the same shape `check-http.ts`'s `httpRules` uses. A guard
+ * no test has ever seen fail is decoration.
+ */
+export const parseRules = {
+  /** The four probe verbs. `multistep`, `smtp`, `browser` and `heartbeat` are
+   * fleet-only and are refused at the database as well as here. */
+  checkTypes: ["http", "tcp", "dns", "ping"] as readonly string[],
+  /**
+   * The six record types a dns check may ask for, byte-identical to the
+   * server's own `z.enum` in `packages/db/api-schemas.ts`.
+   *
+   * This list is a security control, not a convenience. `node:dns`'s
+   * `resolver.resolve(name, type)` accepts `"ANY"`, which is `resolveAny`, the
+   * one query `check-dns.ts`'s header says is never used because RFC 8482 lets
+   * resolvers refuse it. Without this allowlist a server could put `"ANY"`, or
+   * any other type node happens to accept, straight through to the resolver:
+   * the type arrived as an unconstrained string and was passed to the dialer
+   * verbatim, which is precisely the pass-through this vocabulary forbids.
+   */
+  dnsRecordTypes: ["A", "AAAA", "CNAME", "MX", "TXT", "NS"] as readonly string[],
+};
+
+/**
+ * Ports a probe will never legitimately target, mirroring the fleet's
+ * `DENIED_TCP_PORTS` (`packages/db/target-guard.ts`): the RFC 862-865 "simple
+ * TCP services", which exist mainly as amplification and connection-loop
+ * vectors. This prober writes zero application bytes, so smuggling is not the
+ * concern; pointing a customer's own machine at its own chargen is.
+ */
+const DENIED_TCP_PORTS: ReadonlySet<number> = new Set([7, 9, 13, 17, 19]);
+
+/** A tcp port the agent will dial: an integer inside the real port range and
+ * not one of the denied ones. Anything else becomes null, which surfaces to
+ * the customer as a failed result naming the missing configuration rather
+ * than as a silent skip. */
+function tcpPort(raw: unknown): number | null {
+  if (typeof raw !== "number" || !Number.isInteger(raw)) return null;
+  if (raw < 1 || raw > 65_535) return null;
+  if (DENIED_TCP_PORTS.has(raw)) return null;
+  return raw;
+}
 
 /**
  * Validate the poll response instead of casting it.
@@ -187,7 +256,7 @@ export function parseChecks(body: unknown): AgentCheck[] {
       continue;
     }
     const c = item as Record<string, unknown>;
-    if (typeof c.id !== "string" || !CHECK_TYPES.includes(String(c.type))) {
+    if (typeof c.id !== "string" || !parseRules.checkTypes.includes(String(c.type))) {
       skipped++;
       continue;
     }
@@ -196,10 +265,13 @@ export function parseChecks(body: unknown): AgentCheck[] {
       type: c.type as CheckType,
       url: typeof c.url === "string" ? c.url : null,
       tcpHost: typeof c.tcpHost === "string" ? c.tcpHost : null,
-      tcpPort: typeof c.tcpPort === "number" ? c.tcpPort : null,
+      tcpPort: tcpPort(c.tcpPort),
       tcpTls: typeof c.tcpTls === "boolean" ? c.tcpTls : null,
       dnsHostname: typeof c.dnsHostname === "string" ? c.dnsHostname : null,
-      dnsRecordType: typeof c.dnsRecordType === "string" ? c.dnsRecordType : null,
+      dnsRecordType:
+        typeof c.dnsRecordType === "string" && parseRules.dnsRecordTypes.includes(c.dnsRecordType)
+          ? c.dnsRecordType
+          : null,
       dnsExpectedValue: typeof c.dnsExpectedValue === "string" ? c.dnsExpectedValue : null,
       pingHost: typeof c.pingHost === "string" ? c.pingHost : null,
       intervalSeconds: typeof c.intervalSeconds === "number" ? c.intervalSeconds : 60,
@@ -240,4 +312,11 @@ export function parseServiceWatch(body: unknown): string[] {
   const raw = (body as { services?: unknown })?.services;
   if (!Array.isArray(raw)) return [];
   return raw.filter((entry): entry is string => typeof entry === "string");
+}
+
+/** The log snapshot request flag (REA-440, log snapshots phase 1). Anything
+ * other than the literal boolean `true` means "no request", including a v1
+ * server's response, which carries no such field at all. */
+export function parseRequestLogSnapshot(body: unknown): boolean {
+  return (body as { requestLogSnapshot?: unknown })?.requestLogSnapshot === true;
 }

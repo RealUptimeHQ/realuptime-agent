@@ -1,5 +1,5 @@
 #!/bin/sh
-# RealUptime Monitor agent: one-line installer for Linux (REA-181, REA-454).
+# RealUptime Monitor agent: one-line installer for Linux (REA-181, REA-454, REA-601).
 #
 #   curl -fsSL https://realuptime.io/agent/install.sh | REALUPTIME_TOKEN=rua_... sh
 #
@@ -16,23 +16,35 @@
 # `sha256sum install.sh`), so a change here without regenerating that
 # checksum fails the suite rather than shipping a script whose published
 # hash no longer matches what `curl | sh` actually fetches.
-INSTALLER_SCRIPT_VERSION="2"
+INSTALLER_SCRIPT_VERSION="3"
 #
 # What it does, in order, and nothing else:
 #   1. Picks a method: Docker if the docker CLI is present and usable (the
 #      documented default), otherwise a systemd service running the release
-#      tarball under Node.js 22+ that is already installed.
-#   2. Systemd path: downloads the release tarball and its SHA256SUMS from
-#      the release URL, verifies the checksum, and (when cosign is
-#      installed) verifies the detached signature against the public key
-#      served at https://realuptime.io/.well-known/cosign.pub. A checksum or
+#      tarball under Node.js 22+ that is already installed. The Node
+#      version is checked FIRST on the systemd path, before any network
+#      call, so a host with neither Docker nor Node 22+ fails immediately
+#      with a clear message instead of after a download (REA-601).
+#   2. Systemd path: resolves the release tag from the PUBLIC mirror
+#      repository's own releases via the GitHub API, filtered to `agent-*`
+#      tags (REA-601 -- never the monorepo's own `/releases/latest`: that
+#      repository is private, so an anonymous request gets a bare 404
+#      instead of a redirect, and even a working redirect there could land
+#      on a release for a different product). Downloads that release's
+#      tarball and its SHA256SUMS from the release URL, verifies the
+#      checksum, and (when cosign is installed) verifies the detached
+#      signature against the public key served at
+#      https://realuptime.io/.well-known/cosign.pub. A checksum or
 #      signature mismatch aborts before anything is unpacked.
 #      Docker path: when cosign is installed, verifies the image's cosign
 #      signature against the same public key before running it; when cosign
 #      is absent, says so and runs the image unverified, exactly the way the
 #      systemd path always has for a missing cosign binary. Either way this
 #      is a courtesy check, never a hard gate: an unverifiable image still
-#      runs, the same as an unsigned one always has.
+#      runs, the same as an unsigned one always has. A pull the registry
+#      denies (the image is not public yet, or a stale `docker login`) fails
+#      with a message naming exactly that and how to fall back to
+#      --method systemd, not a bare docker error (REA-601).
 #   3. Installs under /opt/realuptime-agent, creates an unprivileged system
 #      user, writes the token to /etc/realuptime-agent/env (root:root 0600),
 #      installs and starts a hardened systemd unit.
@@ -49,7 +61,9 @@ INSTALLER_SCRIPT_VERSION="2"
 #   --method docker|systemd   force a method instead of auto-detecting
 #   --cluster NAME       optional cluster label (REALUPTIME_CLUSTER)
 #   --node NAME          optional node label (REALUPTIME_NODE), default hostname
-#   --version VER        pin a release (default: latest)
+#   --version VER        pin a release (default: latest, or REALUPTIME_AGENT_VERSION)
+#   --print-version      resolve and print the release tag this run would
+#                        install, then exit; no token needed, nothing installed
 #   --uninstall          stop and remove the systemd install (keeps nothing)
 #
 # The source of truth for this file is apps/agent/install/install.sh in the
@@ -58,7 +72,12 @@ INSTALLER_SCRIPT_VERSION="2"
 
 set -eu
 
-RELEASE_BASE="${REALUPTIME_RELEASE_BASE:-https://github.com/realuptimehq/realuptime/releases/download}"
+# The public mirror of apps/agent (scripts/publish-agent-mirror.mjs) --
+# releases live HERE, not on the private monorepo, and this is also where
+# `--version latest` resolves its tag from (see resolve_agent_tag below).
+MIRROR_REPO="realuptimehq/realuptime-agent"
+RELEASE_BASE="${REALUPTIME_RELEASE_BASE:-https://github.com/${MIRROR_REPO}/releases/download}"
+MIRROR_API_BASE="${REALUPTIME_AGENT_API_BASE:-https://api.github.com/repos/${MIRROR_REPO}}"
 COSIGN_KEY_URL="https://realuptime.io/.well-known/cosign.pub"
 IMAGE="ghcr.io/realuptimehq/agent:latest"
 INSTALL_DIR="/opt/realuptime-agent"
@@ -72,8 +91,9 @@ URL="${REALUPTIME_URL:-}"
 METHOD=""
 CLUSTER="${REALUPTIME_CLUSTER:-}"
 NODE_LABEL="${REALUPTIME_NODE:-}"
-VERSION="latest"
+VERSION="${REALUPTIME_AGENT_VERSION:-latest}"
 UNINSTALL=0
+PRINT_VERSION=0
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'realuptime-agent install: %s\n' "$*" >&2; exit 1; }
@@ -87,8 +107,9 @@ while [ $# -gt 0 ]; do
     --cluster) CLUSTER="$2"; shift 2 ;;
     --node) NODE_LABEL="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
+    --print-version) PRINT_VERSION=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
-    -h|--help) sed -n '2,53p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,67p' "$0"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -105,8 +126,51 @@ uninstall_systemd() {
   say "removed the systemd install; the service user $SERVICE_USER was left in place"
 }
 
+# Resolves the release tag this run should install: `agent-$VERSION` when a
+# version was pinned (--version, or REALUPTIME_AGENT_VERSION), or the most
+# recent `agent-*` release on the PUBLIC mirror repository when VERSION is
+# "latest" (the default). Prints the tag on stdout; callers that need it in a
+# variable use `tag="$(resolve_agent_tag)" || exit 1` -- the explicit `|| exit
+# 1` is not decoration: a `die` reached from inside a command substitution's
+# subshell only ends that subshell, so without it a resolution failure would
+# leave `tag` empty and let the script stumble into a download with an empty
+# tag instead of stopping.
+#
+# REA-601: this used to hit https://github.com/realuptimehq/realuptime/
+# releases/latest and read the tag off the redirect's Location header. That
+# repository is the private monorepo: an anonymous request gets a bare 404,
+# never a redirect, so the old code read the tag as the literal path segment
+# "latest" and died on every single default install. Querying the public
+# mirror's own release list through the GitHub REST API needs no redirect to
+# (mis)parse, and it is the only registry an anonymous customer can reach at
+# all -- the mirror's tarball downloads below already depend on that same
+# fact. The result is filtered to `agent-*` tags explicitly, rather than
+# trusting "most recent release" blindly: a misconfigured
+# REALUPTIME_AGENT_API_BASE pointed at the wrong repository, or a mirror that
+# ever carried more than one product's releases, then fails loudly instead of
+# silently installing whatever that repo's newest tag happens to be.
+resolve_agent_tag() {
+  if [ "$VERSION" != "latest" ]; then
+    printf '%s\n' "agent-$VERSION"
+    return 0
+  fi
+  need curl
+  body="$(curl -fsSL "$MIRROR_API_BASE/releases" 2>/dev/null)" \
+    || die "could not reach $MIRROR_API_BASE/releases to resolve the latest agent release; pass --version or set REALUPTIME_AGENT_VERSION"
+  tag="$(printf '%s' "$body" | grep -o '"tag_name": *"agent-[^"]*"' | head -n 1 | sed 's/^"tag_name": *"//; s/"$//')"
+  case "$tag" in
+    agent-*) printf '%s\n' "$tag"; return 0 ;;
+    *) die "could not resolve the latest agent release tag from $MIRROR_API_BASE/releases (no agent-* release found there); pass --version or set REALUPTIME_AGENT_VERSION" ;;
+  esac
+}
+
 if [ "$UNINSTALL" -eq 1 ]; then
   uninstall_systemd
+  exit 0
+fi
+
+if [ "$PRINT_VERSION" -eq 1 ]; then
+  resolve_agent_tag
   exit 0
 fi
 
@@ -150,8 +214,21 @@ install_docker() {
   # The token travels in an env file handed to docker, never in argv.
   tmp="$(mktemp)"
   env_lines > "$tmp"
-  docker run -d --name realuptime-agent --restart unless-stopped --env-file "$tmp" "$IMAGE" >/dev/null
-  rm -f "$tmp"
+  # `docker run` implicitly pulls when the image is not already local, so a
+  # registry that denies the pull (image not public yet, or a stale
+  # `docker login`) surfaces here as a bare docker error unless it is
+  # translated (REA-601): captured rather than streamed so the exact text
+  # can be matched, never printed as noise on the success path.
+  if run_out="$(docker run -d --name realuptime-agent --restart unless-stopped --env-file "$tmp" "$IMAGE" 2>&1)"; then
+    rm -f "$tmp"
+  else
+    rm -f "$tmp"
+    case "$run_out" in
+      *unauthorized*|*denied*)
+        die "could not pull $IMAGE: the registry denied the request. This means the image is not public yet, or your \`docker login ghcr.io\` lost read access to it -- it is not this host's fault. Ask RealUptime to confirm ghcr.io/realuptimehq/agent is public, or install with --method systemd instead (needs Node.js 22+, no Docker). Raw error: $run_out" ;;
+      *) die "docker run failed: $run_out" ;;
+    esac
+  fi
   say "done. The agent is running as container 'realuptime-agent'; it appears in the dashboard within a minute."
 }
 
@@ -177,11 +254,7 @@ install_systemd() {
   major="$(node -p 'process.versions.node.split(".")[0]')"
   [ "$major" -ge 22 ] || die "Node.js $major found; 22 or newer is required"
 
-  tag="agent-$VERSION"
-  if [ "$VERSION" = "latest" ]; then
-    tag="$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/realuptimehq/realuptime/releases/latest | sed 's#.*/##')"
-    case "$tag" in agent-*) ;; *) die "could not resolve the latest agent release tag (got '$tag'); pass --version";; esac
-  fi
+  tag="$(resolve_agent_tag)" || exit 1
   work="$(mktemp -d)"
   tarball="$work/realuptime-agent-${tag#agent-}.tgz"
   say "downloading $tag"

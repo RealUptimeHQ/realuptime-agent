@@ -1,5 +1,6 @@
-import { containerSamples, walkCgroupTree, type CgroupReading } from "./collect-containers.ts";
+import { containerSamples, enrichContainerSamples, walkCgroupTree, type CgroupReading } from "./collect-containers.ts";
 import { cpuUsedRatioFromDelta, readCpuTotals, type CpuTotals } from "./collect-cpu.ts";
+import { DockerEngineClient, enrichDockerContainers, MAX_DOCKER_LOOKUPS_PER_TICK } from "./collect-docker.ts";
 import { diskSamplesFromMounts } from "./collect-disk.ts";
 import { parseLoadAvg } from "./collect-load.ts";
 import { parseMemInfo } from "./collect-memory.ts";
@@ -52,9 +53,27 @@ export class LinuxCollector {
   private lastSampleAt: number | null = null;
   private vantageCache: VantageResult | null = null;
   private rootsCache: { proc: string; sys: string; run: string; fs: string } | null = null;
+  private readonly injectedDocker: DockerEngineClient | undefined;
+  private dockerCache: DockerEngineClient | null = null;
 
-  constructor(platform: HostPlatform, private readonly warn: (key: string, message: string) => void) {
+  constructor(
+    platform: HostPlatform,
+    private readonly warn: (key: string, message: string) => void,
+    docker?: DockerEngineClient,
+  ) {
     this.platform = platform;
+    this.injectedDocker = docker;
+  }
+
+  /** The socket the daemon listens on. Under the Kubernetes DaemonSet host
+   * mount it lives under the same host-root prefix as every other path in
+   * this collector; on an ordinary host it is the well-known path. */
+  private docker(): DockerEngineClient {
+    if (this.injectedDocker) return this.injectedDocker;
+    if (this.dockerCache) return this.dockerCache;
+    const socketPath = `${this.roots().fs}/var/run/docker.sock`;
+    this.dockerCache = new DockerEngineClient({ socketPath, existsSync: (p) => this.platform.existsSync(p) });
+    return this.dockerCache;
   }
 
   roots(): { proc: string; sys: string; run: string; fs: string } {
@@ -145,7 +164,8 @@ export class LinuxCollector {
     if (netNow && previousNet) sample.network = ratesFromCounters(previousNet.counters, netNow, now.getTime() - previousNet.at);
     if (processReadings.length) sample.processes = topProcesses(processReadings, previousProcessCpu, totalCpuDelta);
     if (cgroupReadings.length) {
-      sample.containers = containerSamples(cgroupReadings, previousContainerUsage, elapsedMs, cpuReading.cores);
+      const containers = containerSamples(cgroupReadings, previousContainerUsage, elapsedMs, cpuReading.cores);
+      sample.containers = await this.enrichWithDocker(containers);
     }
     if (serviceWatch.length) {
       sample.services = linuxServiceStatus(serviceWatch, roots.run, (p) => this.platform.existsSync(p));
@@ -216,6 +236,21 @@ export class LinuxCollector {
       (p) => this.platform.readdirSync(p),
       (p) => this.platform.readFileSync(p),
     );
+  }
+
+  /** Docker Engine API enrichment (REA-440), best-effort: a socket that
+   * is not there, not answering, or answers something unparseable simply
+   * leaves the cgroup-only reading in place. Never thrown from here. */
+  private async enrichWithDocker(containers: ReturnType<typeof containerSamples>): Promise<ReturnType<typeof containerSamples>> {
+    const client = this.docker();
+    if (!client.available()) return containers;
+    try {
+      const inspections = await enrichDockerContainers(containers, client, MAX_DOCKER_LOOKUPS_PER_TICK);
+      return enrichContainerSamples(containers, inspections);
+    } catch (err) {
+      this.warn("docker-enrich-failed", `container enrichment via the Docker socket failed: ${err instanceof Error ? err.message : String(err)}`);
+      return containers;
+    }
   }
 
   private tryRead(path: string): string | null {

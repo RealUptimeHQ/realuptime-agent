@@ -21,6 +21,11 @@ export const TICK_MS = 15_000;
  * No check runs faster than one tick. A server-side value below this would
  * otherwise mean "run every tick" anyway, so it is clamped where it can be
  * seen instead of being silently ignored by the grid.
+ *
+ * This is the GRID's floor, and it is not the cadence bound. The cadence bound
+ * is `AgentBounds.minIntervalSeconds` (60s by default, `bounds.ts`), which is
+ * a security control this machine's operator owns; this constant is the
+ * arithmetic limit of a 15 second tick and can never be lowered by anything.
  */
 export const MIN_INTERVAL_SECONDS = 15;
 
@@ -31,6 +36,32 @@ interface Entry {
 
 export class Scheduler {
   private entries = new Map<string, Entry>();
+  /**
+   * The cadence floor this location enforces (`docs/private-probe-locations.md`
+   * section 3.4). Held here rather than read from the environment inside
+   * `intervalMsFor`, so a test states the floor it is testing and the
+   * production path reads it exactly once at startup.
+   *
+   * Defaults to the grid floor so a `new Scheduler()` behaves precisely as it
+   * did before this argument existed.
+   */
+  private readonly floorSeconds: number;
+
+  constructor(floorSeconds: number = MIN_INTERVAL_SECONDS) {
+    this.floorSeconds = Math.max(MIN_INTERVAL_SECONDS, Math.floor(floorSeconds));
+  }
+
+  /**
+   * How many of the checks the server just assigned are being run slower than
+   * it asked, and by how much. Read once per poll for the log line: a customer
+   * whose 30 second checks became 60 second checks has to be able to read the
+   * reason rather than infer it from a chart.
+   */
+  clampedByFloor(checks: readonly AgentCheck[]): number {
+    return checks.filter(
+      (check) => Number.isFinite(check.intervalSeconds) && check.intervalSeconds < this.floorSeconds,
+    ).length;
+  }
 
   /**
    * Reconcile against the list the server just handed us.
@@ -52,14 +83,14 @@ export class Scheduler {
 
     for (const check of checks) {
       seen.add(check.id);
-      const intervalMs = intervalMsFor(check);
+      const intervalMs = intervalMsFor(check, this.floorSeconds);
       const existing = this.entries.get(check.id);
       if (!existing) {
         this.entries.set(check.id, { check, dueAt: now });
         continue;
       }
       const dueAt =
-        intervalMsFor(existing.check) === intervalMs
+        intervalMsFor(existing.check, this.floorSeconds) === intervalMs
           ? existing.dueAt
           : Math.min(existing.dueAt, now + intervalMs);
       this.entries.set(check.id, { check, dueAt });
@@ -82,7 +113,7 @@ export class Scheduler {
     for (const entry of this.entries.values()) {
       if (entry.dueAt > now) continue;
       due.push(entry.check);
-      entry.dueAt = now + intervalMsFor(entry.check);
+      entry.dueAt = now + intervalMsFor(entry.check, this.floorSeconds);
     }
     return due;
   }
@@ -97,9 +128,19 @@ export class Scheduler {
   }
 }
 
-export function intervalMsFor(check: AgentCheck): number {
+/**
+ * One check's real period, in milliseconds, after the cadence floor.
+ *
+ * `floorSeconds` is the location's own bound (`AgentBounds.minIntervalSeconds`)
+ * and is clamped up to the grid floor first, so no caller can accidentally ask
+ * for a cadence the tick cannot deliver. A server that pushes
+ * `intervalSeconds: 1` gets the floor, and so does a server that pushes
+ * `NaN`, a string, or nothing.
+ */
+export function intervalMsFor(check: AgentCheck, floorSeconds: number = MIN_INTERVAL_SECONDS): number {
+  const floor = Math.max(MIN_INTERVAL_SECONDS, Math.floor(floorSeconds));
   const seconds = Number.isFinite(check.intervalSeconds)
-    ? Math.max(MIN_INTERVAL_SECONDS, Math.floor(check.intervalSeconds))
-    : MIN_INTERVAL_SECONDS;
+    ? Math.max(floor, Math.floor(check.intervalSeconds))
+    : floor;
   return seconds * 1000;
 }

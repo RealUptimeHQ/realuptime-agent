@@ -76,3 +76,56 @@ describe("runPingCheck", () => {
     expect(out.error).toMatch(/50% packet loss/);
   });
 });
+
+describe("runPingCheck: the egress guard", () => {
+  beforeEach(() => {
+    runTcpCheck.mockReset();
+  });
+
+  it("refuses before any attempt when the guard says no", async () => {
+    runTcpCheck.mockResolvedValue({ ok: true, latencyMs: 5 });
+    const out = await runPingCheck("public.example", 4, undefined, async () => ({
+      proceed: false,
+      error: "Blocked by this location's local policy (public address)",
+      addresses: [],
+    }));
+    expect(runTcpCheck).not.toHaveBeenCalled();
+    expect(out.ok).toBe(false);
+    expect(out.packetLossPercent).toBe(100);
+    expect(out.error).toContain("Blocked by this location's local policy");
+  });
+
+  it("asks the guard once for the whole probe, not once per attempt", async () => {
+    // Up to twelve connections to one host, and twelve identical verdicts
+    // would buy nothing but twelve DNS lookups.
+    runTcpCheck.mockResolvedValue({ ok: true, latencyMs: 5 });
+    let calls = 0;
+    await runPingCheck("router.internal", 4, undefined, async () => {
+      calls++;
+      return { proceed: true, addresses: [{ address: "10.0.0.1", family: 4 }] };
+    });
+    expect(calls).toBe(1);
+    expect(runTcpCheck).toHaveBeenCalledTimes(4);
+  });
+
+  it("judges the host with a null port, since the candidate ports are its own", async () => {
+    runTcpCheck.mockResolvedValue({ ok: true, latencyMs: 5 });
+    const ports: (number | null)[] = [];
+    await runPingCheck("router.internal", 1, undefined, async (_host, port) => {
+      ports.push(port);
+      return { proceed: true, addresses: [] };
+    });
+    expect(ports).toEqual([null]);
+  });
+
+  it("replays the same decision to every attempt, so all of them stay pinned", async () => {
+    runTcpCheck.mockResolvedValue({ ok: true, latencyMs: 5 });
+    await runPingCheck("router.internal", 2, undefined, async () => ({
+      proceed: true,
+      addresses: [{ address: "10.0.0.1", family: 4 }],
+    }));
+    for (const call of runTcpCheck.mock.calls) {
+      expect(call[4]).toBeTypeOf("function");
+    }
+  });
+});

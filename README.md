@@ -22,7 +22,23 @@ your existing Node.js 22+):
 curl -fsSL https://realuptime.io/agent/install.sh | sh -s -- --token rua_your_token_here
 ```
 
-Docker, one command:
+**The `ghcr.io/realuptimehq/agent` package is not public yet** (REA-601).
+Until RealUptime flips that in GitHub's package settings, an anonymous
+`docker pull` or `docker run` against it fails with `unauthorized` -- which
+includes the Docker half of the one-liner above, on any host where Docker is
+already installed and usable, since that is the path it picks by default.
+`install.sh` says exactly this (not a bare docker error) when a pull is
+denied, and names the fix: force the systemd install instead, which needs
+only Node.js 22+ and no Docker at all:
+
+```
+curl -fsSL https://realuptime.io/agent/install.sh | sh -s -- --token rua_your_token_here --method systemd
+```
+
+Once the package is public, both paths work with no flag needed, and this
+note goes away.
+
+Docker, one command (works once the package above is public):
 
 ```
 docker run -d --name realuptime-agent --restart unless-stopped \
@@ -133,6 +149,15 @@ target. See
 [docs.realuptime.io/monitor-agent](https://docs.realuptime.io/monitor-agent#verify-the-image)
 for the verify command and the public key's stable URL.
 
+The systemd install pins to no version by default: `--version latest`
+resolves the most recent `agent-*` release on this project's public mirror,
+[github.com/RealUptimeHQ/realuptime-agent](https://github.com/RealUptimeHQ/realuptime-agent),
+through the GitHub API (never the private monorepo, which an anonymous
+request cannot reach at all -- REA-601). Pin a specific build with
+`--version 0.3.1` (or `REALUPTIME_AGENT_VERSION=0.3.1`), and see what a run
+would resolve without installing anything with `install.sh --print-version`
+(no token needed).
+
 ## Configuration
 
 Environment variables only. There are no flags and no config file.
@@ -144,23 +169,112 @@ Environment variables only. There are no flags and no config file.
 | `REALUPTIME_URL` | No | `https://realuptime.io` | Override only for a self-hosted or staging deployment. |
 | `REALUPTIME_CLUSTER` | No | none | A label: which cluster this host belongs to. The dashboard groups hosts by it. |
 | `REALUPTIME_NODE` | No | the hostname | A label: this host's node name. |
+| `REALUPTIME_POSTGRES_DSN` | No | none | A `postgresql://user:password@host:port/db` connection string. Off by default: set it to have this agent also report PostgreSQL health (connections, database sizes, cache hit ratio, longest running query, replication lag). See [PostgreSQL metrics](#postgresql-metrics) below. |
+| `REALUPTIME_REDIS_DSN` | No | none | A `redis://[:password@]host:port[/db]` connection string. Off by default: set it to have this agent also report Redis/Valkey health (memory used, connected clients, hit ratio, evicted keys). See [Redis metrics](#redis-metrics) below. |
+| `REALUPTIME_MYSQL_DSN` | No | none | A `mysql://user:password@host:port/db` connection string. Off by default: set it to have this agent also report MySQL/MariaDB health (connections, threads running, slow queries, buffer pool hit ratio, uptime, replication lag). See [MySQL metrics](#mysql-metrics) below. |
+| `REALUPTIME_GPU_VENDOR` | No | `nvidia` | `nvidia`, `amd`, or `intel`. Not a credential, and NVIDIA needs no opt-in: the agent simply looks for `nvidia-smi` on PATH every tick. Set this to `amd` or `intel` only to make an unsupported host say so plainly instead of silently reporting no GPU. See [GPU metrics](#gpu-metrics) below. |
+| `REALUPTIME_LOG_UNITS` | No | none | Comma-separated systemd unit names (`nginx,postgresql@16`). Off by default: set it to let this agent capture a short journald tail from those units, but only when the server asks for one. See [Log snapshots](#log-snapshots) below. |
+| `REALUPTIME_LOG_DOCKER_ENABLED` | No | `false` | `true` opts this host's already-monitored containers into a `docker logs` tail under the same conditions as `REALUPTIME_LOG_UNITS`. No separate container list. |
+| `REALUPTIME_LOG_LINES` | No | `50` | Lines requested per source when a snapshot is captured, clamped to 1-200. |
+| `REALUPTIME_EGRESS_POLICY` | No | `report` | `report` or `enforce`. See [Where this agent will dial](#where-this-agent-will-dial) below. Declaring an allowlist flips the default to `enforce`. |
+| `REALUPTIME_ALLOW_TARGETS` | No | none | Comma-separated CIDRs, bare addresses, or hostname suffixes (`10.0.0.0/8, fd00::/8, .corp.example.com`). When set, a target outside it is refused before any packet leaves. |
+| `REALUPTIME_ALLOW_PORTS` | No | none | Comma-separated ports or ranges (`5432, 8000-8999`). When set, a target on any other port is refused. |
+| `REALUPTIME_ALLOW_LOOPBACK` | No | `false` | `true` lets this agent probe `127.0.0.1` and `::1`. Off by default so a container sharing a host network does not become a probe of that host by accident. |
+| `REALUPTIME_MIN_INTERVAL_SECONDS` | No | `60` | No check runs faster than this, whatever interval the dashboard assigned. Set it to `30` if you pay for 30 second checks and want them. |
+| `REALUPTIME_MAX_CONCURRENT_PROBES` | No | `8` | Probes in flight at once. |
+| `REALUPTIME_MAX_PROBES_PER_MINUTE` | No | `600` | Probes started per rolling minute. Past it, the excess is skipped and each skipped check reports the reason rather than going quiet. |
+| `REALUPTIME_MAX_ASSIGNED_CHECKS` | No | `250` | Checks this agent accepts from one check list. |
 
 A missing token is the only condition that stops the agent. Everything else,
-including a rejected token, is retried indefinitely.
+including a rejected token, is retried indefinitely. A typo in any of the
+optional variables above is ignored and the default stands: a mistyped
+hardening setting must not take your monitoring down, and it never widens
+anything.
 
-The one setting that arrives from the server rather than the environment is
-the **service watch list**: the names of services or units you asked the
+Two settings arrive from the server rather than the environment. The
+**service watch list**: the names of services or units you asked the
 dashboard to report status for. It can only name a unit (the agent validates
-the shape again on receipt), and it is applied on every poll.
+the shape again on receipt), and it is applied on every poll. The **log
+snapshot request**: a one-shot "capture on your next check-in" flag, true
+only right after a threshold alert fires or clears for this host, or when
+you ask for one on demand from the dashboard. It never names a log source --
+that stays entirely in the three variables above, which the server never
+sees.
+
+## Where this agent will dial
+
+The agent takes its check list from RealUptime over the internet, which makes
+that list an instruction channel. This section is the boundary around it, and
+every rule in it is enforced on your machine by settings only you can change.
+
+**Cloud metadata endpoints are refused, always.** `169.254.169.254` and every
+other documented instance-metadata address, on every cloud, in both address
+families. There is no setting that lifts this, because there is no legitimate
+uptime check against an endpoint whose read is a credential. Link-local,
+multicast, broadcast and reserved addresses are refused on the same terms.
+
+**Public addresses are refused, and by default the refusal is only reported.**
+Monitoring a public target is what RealUptime's own regional fleet is for, and
+it does that from ten places instead of one, so an agent that cannot reach the
+public internet loses you nothing and is worthless to anyone who compromises
+RealUptime. This release ships the rule in `report` mode: the agent probes
+exactly as it did before and writes one log line per target it would have
+refused, so you can see what enforcement would cost before it costs you
+anything. Set `REALUPTIME_EGRESS_POLICY=enforce` to turn it on now. A later
+agent release makes `enforce` the default.
+
+**You can narrow it further, and only you can widen it.**
+`REALUPTIME_ALLOW_TARGETS` and `REALUPTIME_ALLOW_PORTS` are read from this
+machine's own environment and never from the check list. That is the point: a
+total compromise of RealUptime cannot widen them, because widening them means
+editing a file on your server and restarting a process.
+
+A refused target reports as a failed check reading `Blocked by this location's
+local policy`, with the rule that refused it. It is never a silent drop, so a
+target somebody added that this agent will not dial shows up on your dashboard
+as a down monitor rather than as nothing at all. The resolved address stays in
+your own logs and is not sent to RealUptime.
+
+**Every address is judged at dial time, on what the name resolves to right
+then**, and again on every redirect hop. For a tcp or ping check the approved
+addresses are then pinned onto the socket, so the connection cannot follow a
+name that moved between the check and the dial. An http check is re-checked per
+hop but cannot be pinned the same way (Node's built-in `fetch` exposes no hook
+for it without adding a dependency this program deliberately does not have), so
+its window is the milliseconds between the agent's lookup and `fetch`'s own.
+
+## How much this agent will do
+
+Four load bounds, all enforced here rather than on our side, because a check
+list is a work order and an unbounded work order is a load generator pointed at
+your own infrastructure:
+
+- **No check runs faster than 60 seconds**, whatever the dashboard assigned. If
+  your plan includes 30 second checks and you want them from this agent, set
+  `REALUPTIME_MIN_INTERVAL_SECONDS=30`. Every clamped check is counted on the
+  agent's own log line each minute, so this is visible rather than mysterious.
+- **At most 8 probes in flight**, so a hundred checks coming due together is a
+  queue and not a burst.
+- **At most 600 probes a minute.** That is 100 checks at a 10 second cadence.
+  Past it the excess is skipped, and each skipped check reports "This location
+  reached its limit of 600 probes a minute and skipped this check" rather than
+  going quiet.
+- **At most 250 checks from one check list.** A longer list is truncated, in
+  the order it arrived, with a log line saying so.
 
 ## What the agent can do
 
-- Run http, tcp, and dns checks against any address reachable from the machine
-  it runs on, including private ranges (`10.0.0.0/8`, `192.168.0.0/16`,
-  `127.0.0.1`). Reaching private addresses is the entire point of the agent;
-  RealUptime's cloud probes deliberately refuse them.
+- Run http, tcp, dns and ping checks against any address reachable from the
+  machine it runs on, including private ranges (`10.0.0.0/8`,
+  `192.168.0.0/16`). Reaching private addresses is the entire point of the
+  agent; RealUptime's cloud probes deliberately refuse them, and this agent
+  refuses the reverse (see [Where this agent will
+  dial](#where-this-agent-will-dial) above).
 - Report its own server health once a minute (see
   [Server health metrics](#server-health-metrics) below).
+- When asked to and only then, capture a small bounded log snapshot from a
+  source you opted in locally, and attach it to its next metrics batch (see
+  [Log snapshots](#log-snapshots) below).
 - Open outbound HTTPS on port 443 to one hostname (`realuptime.io` by default)
   to fetch its check list and post results and metrics.
 - Hold results and metrics in memory through a connectivity loss and deliver
@@ -232,6 +346,162 @@ Practically:
   than the container's), run the agent with host networking, or directly on
   the host, not inside an isolated container.
 
+### PostgreSQL metrics
+
+Off by default. Set `REALUPTIME_POSTGRES_DSN` to a `postgresql://` connection
+string and the agent reads a short, read-only batch of health metrics from
+that instance every tick, alongside the OS-level sample:
+
+- Connection count against the configured `max_connections`.
+- Per-database on-disk size, largest first (bounded, so a cluster with an
+  unusual number of databases costs a fixed amount of wire payload).
+- Buffer cache hit ratio (blocks served from shared_buffers over total block
+  reads, cluster-wide).
+- The oldest still-running query's age.
+- Replication lag, when this instance has replicas.
+
+A role with `pg_monitor` (or superuser) can read every one of these; none of
+them touches your table data. Authentication supports trust, cleartext
+password, and MD5; SCRAM-SHA-256 (the Postgres 14+ default) is not yet
+supported. There is no TLS support in this version: point the DSN at an
+instance reachable without one, typically `localhost` or the same private
+network the agent already runs on. A DSN that is present but unreachable
+(wrong password, database down) costs that tick's PostgreSQL reading only:
+the OS-level sample is unaffected, and the agent retries next tick.
+
+### Redis metrics
+
+Off by default. Set `REALUPTIME_REDIS_DSN` to a `redis://` connection string
+and the agent reads one `INFO` reply from that instance every tick:
+
+- Memory used, against the configured `maxmemory` when one is set.
+- Connected clients.
+- Keyspace hit ratio (`keyspace_hits` over hits plus misses).
+- Evicted keys.
+
+Every one of these is a plain counter `INFO` already reports; the agent never
+issues a command that touches a key. Authentication supports a plain
+password (`AUTH`); there is no TLS support in this version, same limitation
+and same reasoning as PostgreSQL above. A DSN that is present but
+unreachable costs that tick's Redis reading only.
+
+### MySQL metrics
+
+Off by default. Set `REALUPTIME_MYSQL_DSN` to a `mysql://` connection string
+and the agent reads a small, read-only set of health metrics from that
+instance every tick, alongside the OS-level sample:
+
+- Connection count against the configured `max_connections`.
+- Threads actively running a query right now, not merely connected.
+- The cumulative slow-query counter.
+- The InnoDB buffer pool hit ratio (reads served from memory over total
+  logical reads).
+- Server uptime.
+- Replication lag, when this instance is a replica (`Seconds_Behind_Master`
+  or, on MySQL 8.0.22+, `Seconds_Behind_Source`).
+
+This is deliberately not a `SHOW GLOBAL STATUS` dump: that statement returns
+several hundred counters, and only the handful above are read out of it. A
+monitoring user needs no special grant for the status and variables
+statements; the replication statement needs `REPLICATION CLIENT` (MariaDB:
+`REPLICATION CLIENT` or `SLAVE MONITOR`) and, absent it, only replication
+lag degrades to unavailable rather than losing the whole reading.
+
+Authentication supports `mysql_native_password` only. This client always
+offers it, so an account actually configured with
+`mysql_native_password` works even against a MySQL 8+ server whose
+*default* plugin is `caching_sha2_password` (the server corrects a
+mismatched offer with its own `AuthSwitchRequest`, which this client
+follows when it names `mysql_native_password`). An account that genuinely
+requires `caching_sha2_password` is refused: its "full" authentication path
+needs TLS or an RSA public-key exchange this agent does not implement.
+Create the monitoring user with `IDENTIFIED WITH mysql_native_password` to
+avoid this. There is no TLS support in this version, same limitation as the
+other two integrations. A DSN that is present but unreachable costs that
+tick's MySQL reading only.
+
+### GPU metrics
+
+Unlike the three integrations above, there is no DSN and no opt-in: on the
+default `REALUPTIME_GPU_VENDOR=nvidia` the agent simply looks for
+`nvidia-smi` on `PATH` every tick, since reading it needs no credential and
+touches nothing but a local, read-only system tool. Per physical GPU:
+
+- Index and name, so a host with more than one card can tell them apart.
+- Compute utilization.
+- Memory used and total.
+- Temperature.
+- Power draw against its configured limit (null when the card or its power
+  mode does not expose one).
+
+`nvidia-smi` ships with every NVIDIA driver install and is the only GPU
+vendor tool broadly deployable across a fleet without a separate SDK: AMD's
+`rocm-smi` needs the ROCm stack, and Intel's tooling is newer and less
+universally installed. Both are out of scope for this agent version. A host
+with no NVIDIA driver reports no GPU family at all, the same silent
+treatment as "no Docker socket". Set `REALUPTIME_GPU_VENDOR=amd` or `=intel`
+only to make an unsupported host say so plainly: every sample then carries
+a GPU family shaped `{ error }` naming the gap, rather than either silently
+reporting nothing or guessing at numbers this agent cannot produce.
+
+A GPU is a physical fact about the host, unlike a database connection, so a
+tick where `nvidia-smi` is present but errors (driver reinstall in
+progress, a card fallen off the bus) is itself reported as `{ error }`
+rather than silently omitted: an operator paging on GPU health should see
+"nvidia-smi is failing", not nothing.
+
+### Log snapshots
+
+Off by default, and off in a second way even when configured: capturing a log
+snapshot is a completely separate event from the once-a-minute metrics
+sample above, and normally never happens at all. Set `REALUPTIME_LOG_UNITS`,
+`REALUPTIME_LOG_DOCKER_ENABLED`, or both, and the agent becomes ELIGIBLE to
+capture a short tail of recent log lines -- but it only actually captures one
+when the server asks for it on a poll response, which happens for exactly
+two reasons: a threshold alert just fired or cleared for this host, or you
+clicked "request a log snapshot" on the agent's dashboard page. The tail is
+held in memory and attached to the very next metrics batch; it is never
+included on an ordinary tick, and there is no continuous log shipping or
+aggregation here at all.
+
+What gets captured, per opt-in source:
+
+- **journald** (`REALUPTIME_LOG_UNITS`, Linux only): `journalctl -u <unit> -n
+  <N> --no-pager --output=cat` for each named unit, run with a fixed argv --
+  never a shell, never a path the server can influence. Unit names are
+  validated the same way the service watch list's names are (a conservative
+  character class, no path separators, `.service` appended if you left it
+  off).
+- **Docker** (`REALUPTIME_LOG_DOCKER_ENABLED=true`, Linux only): `docker logs
+  --tail <N> <container-id>` for containers this agent is ALREADY reading
+  cgroup metrics from (see [Containers](#server-health-metrics) above).
+  There is no separate list of containers to watch for logs; the eligible
+  set is exactly the set already being monitored.
+
+Each source is capped at `LOG_SNAPSHOT_DEFAULT_LINES` (50) lines by default,
+`LOG_SNAPSHOT_MAX_LINES` (200) at most, each line cut to
+`LOG_SNAPSHOT_MAX_LINE_BYTES` (4096) bytes with a truncation marker appended
+when it is, and at most `LOG_SNAPSHOT_MAX_SOURCES` (10) sources per snapshot.
+The server (`packages/db/server-metrics.ts`) enforces every one of these
+caps again on receipt regardless of what the agent sends.
+
+**Privacy, stated plainly: a captured log line may contain a secret.** A
+password logged by mistake, an API key in a stack trace, a customer's email
+address in an access log -- if your application wrote it to the unit or
+container this feature is pointed at, that line ships to RealUptime exactly
+as captured. This is why the feature is opt-in **per source** and off by
+default: nothing is ever read from journald or Docker unless you name the
+unit or turn Docker capture on yourself. A snapshot is small (bounded by the
+caps above) and short-lived (deleted with the rest of raw retention, 7 days
+on every tier -- see `packages/db/migrations/185_log_snapshots.sql`), but it
+is not scrubbed or redacted in this version. **A redaction pass -- stripping
+patterns that look like secrets before a snapshot ever leaves this
+process -- is explicitly out of scope for this phase and is the gate before
+this feature is ever considered for on-by-default anywhere.** Until that
+lands, only point `REALUPTIME_LOG_UNITS` or `REALUPTIME_LOG_DOCKER_ENABLED`
+at a source whose log lines you are comfortable having RealUptime store
+for a week.
+
 ## Alert thresholds
 
 Every host has three rules, editable on its server health page in the
@@ -251,19 +521,28 @@ These are limits built into the program, not settings you can turn on:
 - **It never runs a shell, and never runs anything the server names.** There
   is no `exec` of a command line, no remote command channel, and nothing in
   the poll response can name a program or a path. The server can tell it
-  which addresses to check, how often, and which service NAMES to report the
-  status of, and nothing else. On Linux it runs no external program at all:
-  every reading is a file under `/proc`, `/sys` or `/run`. On macOS and
-  Windows, which expose no such files, it runs a short FIXED list of stock
-  read-only OS programs with FIXED arguments: `vm_stat`, `df -Pk`,
-  `netstat -ibn`, `ps -Aceo pid=,pcpu=,rss=,comm=`, `launchctl list`,
-  `sw_vers -productVersion` on macOS; one constant `powershell.exe` script
-  (`Get-CimInstance Win32_LogicalDisk`, `Get-NetAdapterStatistics`,
-  `Get-Process`, `Get-Service`) with `wmic logicaldisk` as a fallback on
-  Windows. The list is `ALLOWED_COMMANDS` in `platform.ts`; anything else is
-  refused before it is looked up. A watched service name is applied to the
-  output in this process, after a listing of ALL services returns, so no
-  operator-typed name ever reaches a command line.
+  which addresses to check, how often, which service NAMES to report the
+  status of, and (since log snapshots) only WHEN to capture a log tail --
+  never WHICH unit or container. For its core OS-level metrics, Linux runs
+  no external program at all: every reading is a file under `/proc`, `/sys`
+  or `/run`. On macOS and Windows, which expose no such files, it runs a
+  short FIXED list of stock read-only OS programs with FIXED arguments:
+  `vm_stat`, `df -Pk`, `netstat -ibn`, `ps -Aceo pid=,pcpu=,rss=,comm=`,
+  `launchctl list`, `sw_vers -productVersion` on macOS; one constant
+  `powershell.exe` script (`Get-CimInstance Win32_LogicalDisk`,
+  `Get-NetAdapterStatistics`, `Get-Process`, `Get-Service`) with `wmic
+  logicaldisk` as a fallback on Windows. The one exception to "no external
+  program on Linux" is log snapshots (see [Log snapshots](#log-snapshots)
+  above): `journalctl` and `docker`, and only when you have opted a source
+  in locally AND the server has asked for a snapshot right now. The list is
+  `ALLOWED_COMMANDS` in `platform.ts`; anything else is refused before it is
+  looked up. A watched service name is applied to a full listing in this
+  process, after a listing of ALL services returns, so no operator-typed
+  name ever reaches a command line; a log snapshot's unit or container name
+  is validated against a conservative character class before it becomes an
+  argument, and neither one is ever a name the SERVER supplied -- both come
+  from this machine's own local configuration or its own prior cgroup/Docker
+  discovery.
 - **It reads no configuration file, no credentials, and none of your data.**
   Its complete configuration input is the environment variables above (plus
   the one token file, when you point it at one). What it DOES read is a
@@ -282,16 +561,32 @@ These are limits built into the program, not settings you can turn on:
   and immediately aborts the response body; the body is never buffered, never
   inspected, and never logged. A tcp check writes nothing to the socket and
   reads nothing from it. A dns check reads only the records it queried for.
-- **It sends nothing but check results and server health.** Each check result
-  is a check id, up or down, an http status code where there is one, a
-  latency in milliseconds, an error string when the check failed, and the
-  timestamp of the observation. Each metrics sample is the table above:
-  numbers, interface names, executable names, container ids, and the
-  status of services you asked about. Never a command line, a file listing,
-  or file contents. No inventory, no environment dump.
+- **It sends nothing but check results, server health, and -- rarely, and only
+  when you have opted a source in -- a log snapshot.** Each check result is a
+  check id, up or down, an http status code where there is one, a latency in
+  milliseconds, an error string when the check failed, and the timestamp of
+  the observation. Each metrics sample is the table above: numbers, interface
+  names, executable names, container ids, and the status of services you
+  asked about. Never a command line, a file listing, or file contents outside
+  the one deliberate exception: a log snapshot, sent only when
+  `REALUPTIME_LOG_UNITS` or `REALUPTIME_LOG_DOCKER_ENABLED` is set AND the
+  server asked for one, bounded and unredacted -- see [Log
+  snapshots](#log-snapshots) above for exactly what that means for privacy.
+  No inventory, no environment dump.
 - **It is not a remote access tool.** There is no mechanism in this program by
   which RealUptime, or anyone who compromised RealUptime, could run anything on
   your machine.
+- **It speaks a closed, finite vocabulary and refuses everything outside it.**
+  A check is one of four verbs (http, tcp, dns, ping) and nothing else. An http
+  check is a GET with no request body and no server-chosen headers. A tcp check
+  writes zero bytes and its port must be a real port and not one of the RFC
+  862-865 amplification ports. A dns check may ask for one of six record types
+  (A, AAAA, CNAME, MX, TXT, NS) and nothing else, which is why it can never be
+  turned into a zone transfer or an `ANY` query. A verb, a record type or a
+  port this version of the agent does not recognise is skipped with one log
+  line rather than passed through. That is what makes an old agent safe against
+  a newer server: a compromised server can reuse the capabilities this binary
+  was compiled with, and cannot teach it new ones.
 
 Log lines are single-line JSON, deliberately small, and every string field is
 truncated at 200 characters so that no future diagnostic field can turn your

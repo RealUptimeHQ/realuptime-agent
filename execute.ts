@@ -2,10 +2,30 @@ import { runDnsCheck } from "./check-dns.ts";
 import { runHttpCheck } from "./check-http.ts";
 import { runTcpCheck } from "./check-tcp.ts";
 import { runPingCheck } from "./check-ping.ts";
+import type { EgressGuard } from "./egress-guard.ts";
 import type { AgentCheck, CheckResult } from "./types.ts";
 
 /**
  * Turn one assigned check into one result.
+ *
+ * ## Which probers get the egress guard, and which does not
+ *
+ * `http`, `tcp` and `ping` all open a socket to the target, so all three take
+ * the guard (`docs/private-probe-locations.md` section 3.3).
+ *
+ * `dns` deliberately does not, and the distinction is the definition of the
+ * rule rather than an omission. A dns check never dials its target: it asks
+ * the machine's own resolver about a NAME and compares the answer. The only
+ * socket involved goes to the resolver this host is already configured to use,
+ * which the agent does not choose (3.2: "no arbitrary resolver selection"),
+ * and the answer is read, never connected to. Applying an address policy to a
+ * value nothing dials would refuse the most ordinary private-location dns
+ * check there is: confirming that split-horizon DNS still answers for a public
+ * name from inside the network.
+ *
+ * What bounds a dns check instead is the closed record-type vocabulary in
+ * `api.ts`'s `parseChecks`, which is where a server asking for a zone transfer
+ * or `ANY` is refused.
  *
  * `checkedAt` is stamped HERE, at the top, before the probe runs. Not when the
  * result is queued, and emphatically not when the batch is flushed. The agent
@@ -19,7 +39,7 @@ import type { AgentCheck, CheckResult } from "./types.ts";
  * every other check on the machine down with it, over a server-side field the
  * agent cannot fix.
  */
-export async function executeCheck(check: AgentCheck): Promise<CheckResult> {
+export async function executeCheck(check: AgentCheck, egress?: EgressGuard): Promise<CheckResult> {
   const checkedAt = new Date().toISOString();
 
   try {
@@ -38,7 +58,7 @@ export async function executeCheck(check: AgentCheck): Promise<CheckResult> {
           assertionJsonPath: check.assertionJsonPath,
           assertionJsonOp: check.assertionJsonOp,
           assertionJsonValue: check.assertionJsonValue,
-        });
+        }, egress);
         return {
           checkId: check.id,
           ok: out.ok,
@@ -50,7 +70,13 @@ export async function executeCheck(check: AgentCheck): Promise<CheckResult> {
       }
       case "tcp": {
         if (!check.tcpHost || !check.tcpPort) return malformed(check.id, checkedAt, "no host or port");
-        const out = await runTcpCheck(check.tcpHost, check.tcpPort, check.tcpTls === true);
+        const out = await runTcpCheck(
+          check.tcpHost,
+          check.tcpPort,
+          check.tcpTls === true,
+          undefined,
+          egress,
+        );
         return {
           checkId: check.id,
           ok: out.ok,
@@ -78,7 +104,7 @@ export async function executeCheck(check: AgentCheck): Promise<CheckResult> {
       }
       case "ping": {
         if (!check.pingHost) return malformed(check.id, checkedAt, "no host");
-        const out = await runPingCheck(check.pingHost);
+        const out = await runPingCheck(check.pingHost, undefined, undefined, egress);
         return {
           checkId: check.id,
           ok: out.ok,

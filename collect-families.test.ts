@@ -204,8 +204,12 @@ describe("platform seam", () => {
     await expect(linux.exec("sh", ["-c", "true"])).rejects.toThrow(/not an allow-listed command/);
     const mac = new RealHostPlatform("darwin");
     await expect(mac.exec("curl", ["https://example.com"])).rejects.toThrow(/not an allow-listed command/);
-    // Linux runs nothing at all; the other two lists are short and stock.
-    expect(ALLOWED_COMMANDS.linux).toEqual([]);
+    // Every core metric reading (CPU/memory/disk/network/processes/
+    // containers) still runs no command on Linux at all. journalctl and
+    // docker are the one opt-in exception (REA-440, log snapshots phase 1,
+    // collect-logs.ts) and only fire on an explicit snapshot request; the
+    // other two lists are short and stock.
+    expect(ALLOWED_COMMANDS.linux).toEqual(["journalctl", "docker"]);
     expect(ALLOWED_COMMANDS.darwin).toEqual(["vm_stat", "df", "netstat", "ps", "launchctl", "sw_vers"]);
     expect(ALLOWED_COMMANDS.windows).toEqual(["powershell.exe", "wmic"]);
   });

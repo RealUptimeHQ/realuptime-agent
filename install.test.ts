@@ -99,6 +99,72 @@ describe("installers", () => {
     expect(ps).toContain("-AtStartup");
   });
 
+  // REA-601: the Linux installer used to resolve "latest" by hitting the
+  // PRIVATE monorepo's /releases/latest and reading the tag off the
+  // redirect. That repository answers an anonymous request with a bare 404
+  // (never a redirect), so every default install died with "could not
+  // resolve the latest agent release tag". These pin the fix: resolution
+  // comes from the PUBLIC mirror's own release list via the GitHub API,
+  // filtered to agent-* tags, with an explicit override, and the old broken
+  // pattern is gone for good.
+  it("the Linux installer resolves the latest release from the public mirror's API, never the private monorepo's redirect", () => {
+    const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
+    expect(sh).toContain("resolve_agent_tag");
+    expect(sh).toContain('MIRROR_REPO="realuptimehq/realuptime-agent"');
+    // Pinning the shell variable reference literally, not a JS template.
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: this is shell source, not a JS template string
+    expect(sh).toContain("api.github.com/repos/${MIRROR_REPO}");
+    expect(sh).toContain("REALUPTIME_AGENT_VERSION");
+    expect(sh).toContain("--print-version");
+    // The old, broken redirect-based resolution must not come back.
+    expect(sh).not.toContain("github.com/realuptimehq/realuptime/releases/latest");
+  });
+
+  it("the Linux installer's tag resolver only ever accepts an agent-* tag (mutation guard)", () => {
+    const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
+    // The filter that would catch a mirror answering with the wrong
+    // product's release, or a misconfigured REALUPTIME_AGENT_API_BASE
+    // pointed at the wrong repository: a matched tag must start with
+    // "agent-", and anything else is a hard failure, never a silent accept.
+    expect(sh).toMatch(/agent-\[\^"\]\*"/);
+    expect(sh).toMatch(/case "\$tag" in\s*\n\s*agent-\*\) printf/);
+    expect(sh).toContain("no agent-* release found there");
+  });
+
+  it("the Linux installer checks Node.js 22+ before any network call on the systemd path", () => {
+    const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
+    // Anchored to install_systemd()'s own body: resolve_agent_tag's usage
+    // pattern is also quoted verbatim in that function's doc comment further
+    // up the file, so a plain indexOf from the top would find the docstring
+    // rather than the real call site.
+    // Anchored with a leading newline: a plain indexOf("install_systemd() {")
+    // finds it as a SUBSTRING of "uninstall_systemd() {" (which is defined
+    // earlier), since "un" + "install_systemd..." contains the same text.
+    const fnIdx = sh.indexOf("\ninstall_systemd() {");
+    expect(fnIdx).toBeGreaterThan(-1);
+    const nodeCheckIdx = sh.indexOf("Node.js 22 or newer is required for the systemd install", fnIdx);
+    const resolveIdx = sh.indexOf('tag="$(resolve_agent_tag)"', fnIdx);
+    expect(nodeCheckIdx).toBeGreaterThan(fnIdx);
+    expect(resolveIdx).toBeGreaterThan(fnIdx);
+    expect(nodeCheckIdx).toBeLessThan(resolveIdx);
+  });
+
+  it("the Linux installer's Docker path names a denied pull plainly, with the systemd fallback, not a bare docker error", () => {
+    const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
+    expect(sh).toContain("the registry denied the request");
+    expect(sh).toContain("install with --method systemd instead");
+    expect(sh).toMatch(/\*unauthorized\*/);
+  });
+
+  it("the Windows installer resolves the latest release from the same public mirror's API, never the private monorepo's redirect", () => {
+    const ps = readFileSync(join(HERE, "install", "install-windows.ps1"), "utf8");
+    expect(ps).toContain('$MirrorRepo = "realuptimehq/realuptime-agent"');
+    expect(ps).toContain("api.github.com/repos/$MirrorRepo");
+    expect(ps).toContain("REALUPTIME_AGENT_VERSION");
+    expect(ps).toContain("agent-*");
+    expect(ps).not.toContain("github.com/realuptimehq/realuptime/releases/latest");
+  });
+
   it("the DaemonSet reads the node through /host, one token file per node, as a non-root read-only container", () => {
     const yaml = readFileSync(join(HERE, "deploy", "kubernetes", "daemonset.yaml"), "utf8");
     expect(yaml).toContain("kind: DaemonSet");

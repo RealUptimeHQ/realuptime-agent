@@ -1,3 +1,4 @@
+import type { DockerInspection } from "./collect-docker.ts";
 import type { ContainerSample } from "./types.ts";
 
 /**
@@ -175,6 +176,31 @@ export function walkCgroupTree(
     }
   }
   return readings;
+}
+
+/**
+ * Layers Docker Engine API inspections (REA-440) onto cgroup-derived
+ * samples, keyed by container id. Additive only: a sample with no
+ * matching inspection is returned exactly as it came in, so a Docker-less
+ * host or a lookup that failed never loses the cgroup-measured fields.
+ */
+export function enrichContainerSamples(
+  samples: readonly ContainerSample[],
+  inspections: ReadonlyMap<string, DockerInspection>,
+): ContainerSample[] {
+  if (inspections.size === 0) return samples as ContainerSample[];
+  return samples.map((s) => {
+    const info = inspections.get(s.id);
+    if (!info) return s;
+    return {
+      ...s,
+      name: s.name ?? info.name,
+      image: info.image,
+      state: info.state,
+      restartCount: info.restartCount,
+      health: info.health,
+    };
+  });
 }
 
 function tryRead<T>(readFile: (p: string) => string, path: string, parse: (t: string) => T | null): T | null {

@@ -1,5 +1,6 @@
 import net, { isIP } from "node:net";
 import tls from "node:tls";
+import { createPinnedLookup, type EgressGuard } from "./egress-guard.ts";
 
 /**
  * The tcp check: did the connection complete, and (when tls is on) did the
@@ -20,6 +21,19 @@ import tls from "node:tls";
  * would learn to ignore the agent. Certificate EXPIRY is a separate product
  * surface with its own alerting; conflating it with reachability makes the
  * reachability signal useless.
+ *
+ * ## The egress guard, and the pin
+ *
+ * `egress` is where `docs/private-probe-locations.md` section 3.3 lands on
+ * this prober: the guard resolves the host, judges every answer, and hands
+ * back the approved addresses. Those addresses become the socket's `lookup`,
+ * so `net`/`tls` replay them instead of resolving the name a second time and
+ * the connection physically cannot land somewhere the policy never saw. The
+ * hostname is still passed as `host`, which is what keeps SNI deriving from
+ * the name the customer entered.
+ *
+ * Omitting `egress` is the pre-guard behaviour, unchanged, and is what every
+ * existing test and the ping prober's inner attempts rely on.
  */
 
 export const DEFAULT_TIMEOUT_MS = 10_000;
@@ -35,8 +49,15 @@ export async function runTcpCheck(
   port: number,
   useTls: boolean,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  egress?: EgressGuard,
 ): Promise<TcpOutcome> {
   const started = Date.now();
+
+  const decision = egress ? await egress(host, port) : null;
+  if (decision && !decision.proceed) {
+    return { ok: false, latencyMs: Date.now() - started, error: decision.error };
+  }
+  const lookup = decision && decision.addresses.length > 0 ? createPinnedLookup(decision.addresses) : undefined;
 
   return new Promise<TcpOutcome>((resolve) => {
     let settled = false;
@@ -70,10 +91,11 @@ export async function runTcpCheck(
           // servers abort the handshake outright.
           servername: isIP(host) ? undefined : host,
           rejectUnauthorized: false,
+          ...(lookup ? { lookup } : {}),
         });
         socket.once("secureConnect", () => finish({ ok: true, latencyMs: Date.now() - started }));
       } else {
-        socket = net.connect({ host, port });
+        socket = net.connect({ host, port, ...(lookup ? { lookup } : {}) });
         socket.once("connect", () => finish({ ok: true, latencyMs: Date.now() - started }));
       }
       socket.once("error", (err: Error) => {

@@ -72,12 +72,20 @@ export interface CheckResult {
 /** The /poll response body. `services` arrived with protocol v2 (REA-181):
  * the opt-in list of service/unit names this host should report status
  * for, set per host in the dashboard. Absent or empty means "watch none",
- * which is exactly what a v1 server sends. It is the ONLY server-pushed
- * setting that changes what the agent reads locally, and it can only name
- * service units, never a path: see `collect-services.ts`. */
+ * which is exactly what a v1 server sends. `requestLogSnapshot` (REA-440,
+ * log snapshots phase 1) is the second and only other server-pushed
+ * setting: a one-shot "capture a log snapshot on your next tick" flag, true
+ * when the server has a reason to want one right now (a threshold alert
+ * just fired or cleared for this agent, or an operator asked for one
+ * on-demand from the dashboard) and within the last few minutes. It names
+ * no path and no unit; it only tells the agent WHEN, never WHAT -- the
+ * WHAT is `REALUPTIME_LOG_UNITS`/`REALUPTIME_LOG_DOCKER_ENABLED`, set
+ * locally on the machine and never visible to the server. See
+ * `collect-logs.ts`. */
 export interface PollResponse {
   checks: AgentCheck[];
   services?: string[];
+  requestLogSnapshot?: boolean;
 }
 
 /**
@@ -179,9 +187,35 @@ export interface ProcessSample {
   memoryBytes: number;
 }
 
+/** The daemon's own lifecycle state for a container (REA-440), as reported
+ * by `docker inspect`'s `State.Status`. Not derivable from a cgroup: a
+ * `restarting` or `created` container may have no cgroup reading yet, and
+ * an `exited` one's cgroup is often already gone. */
+export type ContainerState =
+  | "created"
+  | "running"
+  | "paused"
+  | "restarting"
+  | "removing"
+  | "exited"
+  | "dead";
+
+/** A healthcheck's status (REA-440). `"none"` means the image defines no
+ * healthcheck at all, distinct from simply not having asked: a dashboard
+ * needs to tell "healthy" apart from "this container cannot report
+ * health" rather than collapsing both into an absent field. */
+export type ContainerHealth = "none" | "starting" | "healthy" | "unhealthy";
+
 /** One container within a sample, read from cgroup v2 on a Linux host.
  * Absent (not empty) on macOS and Windows, whose Docker runs in a VM the
- * host cannot see into. */
+ * host cannot see into.
+ *
+ * `image`, `state`, `restartCount` and `health` (REA-440) are Docker Engine
+ * API enrichment layered onto the cgroup reading (see `collect-docker.ts`)
+ * and are OPTIONAL, exactly like every protocol v2 family field: a
+ * cgroup-only reading (no Docker socket reachable, a non-docker runtime,
+ * an older agent build) omits them rather than sending nulls, and a server
+ * or dashboard built before REA-440 ignores them entirely. */
 export interface ContainerSample {
   /** The runtime's container id, full length as found in the cgroup path. */
   id: string;
@@ -193,6 +227,14 @@ export interface ContainerSample {
   memoryUsedBytes: number;
   /** The cgroup's memory.max, null when unlimited ("max"). */
   memoryLimitBytes: number | null;
+  /** The image reference the container was created from, e.g. "nginx:1.27". */
+  image?: string | null;
+  state?: ContainerState | null;
+  /** Cumulative restarts since the container was created, as the daemon
+   * counts them. An increase between two samples is a signal worth
+   * alerting on even when the container is currently running. */
+  restartCount?: number | null;
+  health?: ContainerHealth | null;
 }
 
 export type ServiceStatus = "active" | "inactive" | "failed" | "unknown";
@@ -201,6 +243,149 @@ export type ServiceStatus = "active" | "inactive" | "failed" | "unknown";
 export interface ServiceSample {
   name: string;
   status: ServiceStatus;
+}
+
+/** One named database's on-disk size within a `PostgresSample`, largest
+ * first, bounded at `MAX_POSTGRES_DATABASES_PER_SAMPLE`
+ * (collect-postgres.ts). */
+export interface PostgresDatabaseSample {
+  name: string;
+  sizeBytes: number;
+}
+
+/** A PostgreSQL instance's own health (REA-440 phase 3), read from
+ * `pg_stat_activity` / `pg_settings` / `pg_stat_database` / `pg_database` /
+ * `pg_stat_replication` -- see collect-postgres.ts. Config-gated: present
+ * only when `REALUPTIME_POSTGRES_DSN` is set and the connection attempt for
+ * this tick succeeded. */
+export interface PostgresSample {
+  connections: number;
+  /** Null when `pg_settings` could not be read (should not happen for a
+   * role with monitoring privileges, but nothing here assumes it). */
+  maxConnections: number | null;
+  /** Largest first, at most `MAX_POSTGRES_DATABASES_PER_SAMPLE`. */
+  databases: PostgresDatabaseSample[];
+  /** 0..1 fraction, blocks served from shared_buffers over total block
+   * reads. Null on a cluster with no reads of either kind yet. */
+  cacheHitRatio: number | null;
+  /** Age in seconds of the oldest still-active query, 0 when none is
+   * running. */
+  longestQuerySeconds: number;
+  /** Seconds, the furthest-behind replica as seen from a primary. Null on
+   * an instance with no replicas visible (standalone, or this is itself a
+   * standby, whose own lag is not exposed by this view). */
+  replicationLagSeconds: number | null;
+}
+
+/** A Redis/Valkey instance's own health (REA-440 phase 3), read from one
+ * `INFO` reply -- see collect-redis.ts. Config-gated: present only when
+ * `REALUPTIME_REDIS_DSN` is set and the connection attempt for this tick
+ * succeeded. */
+export interface RedisSample {
+  usedMemoryBytes: number;
+  /** Null when `maxmemory` is unset (Redis's own 0 = unlimited). */
+  maxMemoryBytes: number | null;
+  connectedClients: number;
+  /** 0..1 fraction, keyspace_hits over hits+misses. Null when neither has
+   * happened yet. */
+  hitRatio: number | null;
+  evictedKeys: number;
+}
+
+/** A MySQL/MariaDB instance's own health (REA-440 phase 4), read from
+ * `SHOW GLOBAL STATUS` / `SHOW GLOBAL VARIABLES` / `SHOW SLAVE STATUS` --
+ * see collect-mysql.ts. Config-gated: present only when
+ * `REALUPTIME_MYSQL_DSN` is set and the connection attempt for this tick
+ * succeeded. Same single-object shape as `PostgresSample`/`RedisSample`:
+ * one instance has one reading per instant, not a list of them. */
+export interface MysqlSample {
+  connections: number;
+  /** Null when `max_connections` could not be read. */
+  maxConnections: number | null;
+  /** Threads actively executing a query right now, not merely connected. */
+  threadsRunning: number;
+  /** Cumulative counter since server start, same treatment as Redis's
+   *  `evictedKeys`. */
+  slowQueries: number;
+  /** 0..1 fraction, InnoDB buffer pool reads served from memory over total
+   * logical reads. Null on a server with no reads of either kind yet. */
+  bufferPoolHitRatio: number | null;
+  uptimeSeconds: number;
+  /** Seconds, this instance's own lag as a replica. Null on a standalone
+   * instance or a primary (an empty `SHOW SLAVE STATUS`), and also null
+   * when the column itself is NULL (a replica whose IO thread is not
+   * currently connected, whose lag is genuinely unknown, not zero). */
+  replicationLagSeconds: number | null;
+}
+
+/** One physical GPU's health at this instant (REA-440 phase 5), read from
+ * one `nvidia-smi --query-gpu=... --format=csv,noheader,nounits` row -- see
+ * collect-gpu.ts. Unlike Postgres/Redis/MySQL, a host can have more than
+ * one GPU, so the family is an array of these, not a single object. */
+export interface GpuReading {
+  /** `nvidia-smi`'s own device index, stable across ticks on one host. */
+  index: number;
+  name: string;
+  /** 0..1 fraction, same unit as `cpuUsedRatio`, from nvidia-smi's
+   * `utilization.gpu` (a 0..100 percent) divided by 100. */
+  utilizationRatio: number;
+  memoryUsedBytes: number;
+  memoryTotalBytes: number;
+  temperatureCelsius: number;
+  /** Null when nvidia-smi reports `[N/A]` for this field: some cards and
+   * some power modes do not expose power telemetry at all. */
+  powerDrawWatts: number | null;
+  powerLimitWatts: number | null;
+}
+
+/** GPU collection was attempted this tick but could not produce a
+ * truthful reading: `nvidia-smi` is present but errored (driver issue,
+ * card fallen off the bus, permissions), its output did not parse, or
+ * `REALUPTIME_GPU_VENDOR` names a vendor this agent version does not
+ * implement (amd, intel). Distinct from the family being entirely absent
+ * (no `nvidia-smi` binary found at all -- see collect-gpu.ts's module
+ * comment for why the two are not collapsed into one "no GPU" state). */
+export interface GpuUnavailable {
+  error: string;
+}
+
+/** Present only when GPU collection was attempted this tick: absent
+ * entirely means no NVIDIA driver was found on this host (the common,
+ * silent case, same treatment as "no Docker socket"). An array (possibly
+ * multi-GPU) on success, `GpuUnavailable` when nvidia-smi exists but this
+ * tick's reading failed, or the vendor is explicitly unsupported. */
+export type GpuSample = GpuReading[] | GpuUnavailable;
+
+/** Where a captured log tail came from (REA-440, log snapshots phase 1). */
+export type LogSnapshotSourceType = "journald" | "docker";
+
+/** A small, bounded tail of recent log lines from one opt-in source,
+ * captured only when the server asked for one (see `PollResponse.
+ * requestLogSnapshot` above) and held in agent memory until the next
+ * metrics flush -- never collected on every tick, never shipped with every
+ * sample. See collect-logs.ts for the caps and the capture rule.
+ *
+ * Redaction is explicitly OUT of scope for phase 1 (see apps/agent/
+ * README.md): a log line the operator's own application wrote may contain
+ * a secret, and this snapshot ships it verbatim. The feature is opt-in per
+ * source for exactly that reason. */
+export interface LogSnapshot {
+  /** The unit name or container id/name this tail came from, as configured
+   * locally -- never a path. */
+  source: string;
+  sourceType: LogSnapshotSourceType;
+  /** ISO 8601, when the capture ran (not when the batch was flushed). */
+  capturedAt: string;
+  /** Oldest first, at most `LOG_SNAPSHOT_MAX_LINES` (collect-logs.ts). */
+  lines: string[];
+  /** True when more lines existed than were captured (best-effort: exactly
+   * `lines.length` came back from the capture command, which is itself
+   * capped, so this is "the source may have had more", not a precise
+   * count). */
+  truncatedLines: boolean;
+  /** True when one or more lines were cut to `LOG_SNAPSHOT_MAX_LINE_BYTES`
+   * and had a truncation marker appended. */
+  truncatedBytes: boolean;
 }
 
 export type HostOs = "linux" | "darwin" | "windows" | "other";
@@ -248,6 +433,26 @@ export interface MetricSample {
   processes?: ProcessSample[];
   containers?: ContainerSample[];
   services?: ServiceSample[];
+  /** REA-440 phase 3: present only when `REALUPTIME_POSTGRES_DSN` is
+   * configured and this tick's connection succeeded. */
+  postgres?: PostgresSample;
+  /** REA-440 phase 3: present only when `REALUPTIME_REDIS_DSN` is
+   * configured and this tick's connection succeeded. */
+  redis?: RedisSample;
+  /** REA-440 phase 4: present only when `REALUPTIME_MYSQL_DSN` is
+   * configured and this tick's connection succeeded. */
+  mysql?: MysqlSample;
+  /** REA-440 phase 5: present only when GPU collection was attempted this
+   * tick (an NVIDIA driver was found, or `REALUPTIME_GPU_VENDOR` names an
+   * unsupported vendor). Absent means no GPU collection to report at all,
+   * not "zero GPUs". See `GpuSample`. */
+  gpu?: GpuSample;
+  /** REA-440, log snapshots phase 1: present only when the server asked for
+   * one on the last poll (`PollResponse.requestLogSnapshot`) AND at least
+   * one opt-in source is configured. Absent on every ordinary sample --
+   * this is the field the whole feature exists to keep off the wire except
+   * at an alert or an on-demand pull. */
+  logs?: LogSnapshot[];
 }
 
 /** The `/metrics` request body. At most 100 samples, each with at most 32

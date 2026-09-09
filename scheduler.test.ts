@@ -110,3 +110,55 @@ describe("Scheduler", () => {
     expect(s.dueAt("a")).toBe(660_000);
   });
 });
+
+/**
+ * The cadence floor, section 3.4 of `docs/private-probe-locations.md`.
+ *
+ * The one bound of the four that a customer feels rather than only an attacker
+ * does: a Scale account's 30 second agent-bound checks run at 60 seconds until
+ * the person who owns the machine says otherwise, on the machine. That is the
+ * design's decision, not an accident, and these tests are what make it a
+ * decision somebody has to change on purpose.
+ */
+describe("Scheduler: the cadence floor", () => {
+  it("clamps a server-assigned interval below the floor up to it", () => {
+    const s = new Scheduler(60);
+    s.sync([check("a", 1)], 0);
+    s.takeDue(0);
+    expect(s.dueAt("a")).toBe(60_000);
+  });
+
+  it("leaves an interval at or above the floor alone", () => {
+    const s = new Scheduler(60);
+    s.sync([check("a", 300)], 0);
+    s.takeDue(0);
+    expect(s.dueAt("a")).toBe(300_000);
+  });
+
+  it("counts what it clamped, so the log line can say so", () => {
+    const s = new Scheduler(60);
+    expect(s.clampedByFloor([check("a", 30), check("b", 60), check("c", 300)])).toBe(1);
+    expect(s.clampedByFloor([check("a", 60)])).toBe(0);
+  });
+
+  it("cannot be configured below the grid's own floor", () => {
+    const s = new Scheduler(1);
+    s.sync([check("a", 1)], 0);
+    s.takeDue(0);
+    expect(s.dueAt("a")).toBe(MIN_INTERVAL_SECONDS * 1000);
+  });
+
+  it("a server that pushes a non-number gets the floor, not NaN", () => {
+    expect(intervalMsFor({ ...check("a", 60), intervalSeconds: NaN }, 60)).toBe(60_000);
+    expect(intervalMsFor({ ...check("a", 60), intervalSeconds: "30" as unknown as number }, 60)).toBe(60_000);
+  });
+
+  /** MUTATION TEST: lower the floor and the clamp has to stop happening. */
+  it("mutation: with the floor lowered, the 1 second interval is no longer clamped to 60", () => {
+    const s = new Scheduler(MIN_INTERVAL_SECONDS);
+    s.sync([check("a", 1)], 0);
+    s.takeDue(0);
+    expect(s.dueAt("a")).not.toBe(60_000);
+    expect(s.dueAt("a")).toBe(MIN_INTERVAL_SECONDS * 1000);
+  });
+});

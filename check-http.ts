@@ -1,3 +1,4 @@
+import type { EgressGuard } from "./egress-guard.ts";
 import {
   evaluateHttpAssertions,
   hasHttpAssertions,
@@ -9,7 +10,7 @@ import {
 /**
  * The http check, run from inside the customer's network.
  *
- * ## No SSRF guard here, on purpose
+ * ## The address rule here is the fleet's, inverted
  *
  * The cloud fleet (`packages/checker`) refuses private addresses, because a
  * customer could otherwise point our probes at our own internals or at someone
@@ -17,8 +18,17 @@ import {
  * customer owns, was started by the customer, and exists precisely to reach
  * `10.0.3.14:8080`. Blocking private addresses here would block the product.
  *
- * What that removes is the address blocklist. Everything else the fleet probe
- * does for its own safety is kept, because those were never about SSRF:
+ * What replaces it is `egress-policy.ts`, which runs the same address
+ * arithmetic with the verdict the other way up: a private location refuses
+ * PUBLIC space, refuses cloud metadata endpoints unconditionally, and honours
+ * an allowlist held on the customer's own machine
+ * (`docs/private-probe-locations.md` section 3.3). It arrives here as the
+ * optional `egress` argument and is consulted on the first request AND on
+ * every redirect hop, because a redirect is a dial at an address the first
+ * verdict never saw.
+ *
+ * Everything else the fleet probe does for its own safety was already here and
+ * was never about SSRF:
  *
  * - A hard total deadline, so a stalled target cannot pin a scheduler slot.
  * - The body is never buffered UNLESS a response assertion needs it (Monitor
@@ -62,6 +72,10 @@ export async function runHttpCheck(
    * assertion field set, means exact prior behavior: the body is never read
    * and only the status line (via `httpRules.isUp`) decides up/down. */
   assertions?: HttpAssertionConfig,
+  /** The egress policy for this location (section 3.3). Omitted means the
+   * pre-guard behaviour: dial whatever the URL names. Supplied, it is asked
+   * before the first request and again before every redirect hop. */
+  egress?: EgressGuard,
 ): Promise<HttpOutcome> {
   const withAssertions = assertions && hasHttpAssertions(assertions) ? assertions : undefined;
   const started = Date.now();
@@ -90,6 +104,17 @@ export async function runHttpCheck(
         latencyMs: Date.now() - started,
         error: `${label}: ${target.protocol.replace(":", "")} is not http or https`,
       };
+    }
+
+    if (egress) {
+      // Per hop, never once per check. A hostname that resolves privately on
+      // the first dial and publicly on the second is exactly the DNS-rebinding
+      // shape this has to catch, and a redirect is the cheapest way to reach a
+      // second host entirely.
+      const decision = await egress(target.hostname, portFor(target));
+      if (!decision.proceed) {
+        return { ok: false, latencyMs: Date.now() - started, error: decision.error };
+      }
     }
 
     const controller = new AbortController();
@@ -187,6 +212,15 @@ export async function runHttpCheck(
   }
 
   return { ok: false, latencyMs: Date.now() - started, error: "Too many redirects" };
+}
+
+/** The port this URL will actually dial, which is what the allowlist's port
+ * half is a statement about. `URL.port` is empty for a default port, and a
+ * policy that only ever saw the explicit ones would let `https://host/` past a
+ * rule that names 443. */
+function portFor(target: URL): number {
+  if (target.port) return Number(target.port);
+  return target.protocol === "https:" ? 443 : 80;
 }
 
 /**

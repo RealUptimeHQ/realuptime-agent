@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthError, TransientError, VantageConflictError } from "./api.ts";
+import { DEFAULT_BOUNDS, type AgentBounds } from "./bounds.ts";
 import { FLUSH_BATCH_SIZE, ResultBuffer } from "./buffer.ts";
+import { EgressReport, type EgressGuard } from "./egress-guard.ts";
 import { logSink } from "./log.ts";
 import { METRICS_FLUSH_BATCH_SIZE, MetricsBuffer } from "./metrics-buffer.ts";
 import {
@@ -26,6 +28,9 @@ function check(id: string, intervalSeconds = 60): AgentCheck {
   return { id, type: "http", url: `http://10.0.0.1/${id}`, intervalSeconds };
 }
 
+/** The cadence floor these suites assumed before `bounds.ts` existed. */
+const FIFTEEN_SECOND_FLOOR: AgentBounds = { ...DEFAULT_BOUNDS, minIntervalSeconds: 15 };
+
 class FakeApi {
   checks: AgentCheck[] = [];
   sent: CheckResult[][] = [];
@@ -38,11 +43,12 @@ class FakeApi {
   metricsResponse: MetricsResponse = { accepted: 0, rejectedStale: 0, rejectedFuture: 0, rejectedDuplicate: 0 };
 
   services: string[] = [];
+  requestLogSnapshot = false;
 
-  async poll(): Promise<{ checks: AgentCheck[]; services: string[] }> {
+  async poll(): Promise<{ checks: AgentCheck[]; services: string[]; requestLogSnapshot: boolean }> {
     this.pollCalls++;
     if (this.pollError) throw this.pollError;
-    return { checks: this.checks, services: this.services };
+    return { checks: this.checks, services: this.services, requestLogSnapshot: this.requestLogSnapshot };
   }
 
   async sendResults(results: CheckResult[]): Promise<void> {
@@ -65,6 +71,7 @@ class FakeMetricsSource implements MetricsSource {
   nextSample: MetricSample | null = null;
   vantageValue: { vantage: MetricsVantage; detail: string | null } = { vantage: "host", detail: null };
   watchLists: (readonly unknown[])[] = [];
+  logSnapshotRequests = 0;
   throwOnCollect: Error | null = null;
 
   async collect(): Promise<MetricSample | null> {
@@ -84,6 +91,10 @@ class FakeMetricsSource implements MetricsSource {
   setServiceWatch(names: readonly unknown[]): void {
     this.watchLists.push(names);
   }
+
+  requestLogSnapshot(): void {
+    this.logSnapshotRequests++;
+  }
 }
 
 function metricSample(n: number): MetricSample {
@@ -97,11 +108,21 @@ function metricSample(n: number): MetricSample {
   };
 }
 
+/**
+ * `bounds` defaults to the production numbers, so every test that does not
+ * name them is exercising what a real install does. The two outage tests below
+ * pass a 15 second cadence floor on purpose: they are about the buffer and the
+ * backoff curve, and they were written when the scheduler's own 15 second grid
+ * floor was the only floor there was. Pinning the floor they assume keeps them
+ * testing what they were written to test rather than quietly retesting
+ * `bounds.ts`.
+ */
 function harness(
   api: FakeApi,
   buffer = new ResultBuffer(),
   metricsSource: MetricsSource = new FakeMetricsSource(),
   metricsBuffer = new MetricsBuffer(),
+  bounds: AgentBounds = DEFAULT_BOUNDS,
 ) {
   let now = 0;
   const runtime = new AgentRuntime({
@@ -109,6 +130,7 @@ function harness(
     buffer,
     metricsSource,
     metricsBuffer,
+    bounds,
     now: () => now,
     execute: async (c: AgentCheck) => ({
       checkId: c.id,
@@ -262,7 +284,7 @@ describe("AgentRuntime", () => {
     api.checks = [check("a", 15)];
     api.pollError = new TransientError("offline");
     api.sendError = new TransientError("offline");
-    const h = harness(api);
+    const h = harness(api, undefined, undefined, undefined, FIFTEEN_SECOND_FLOOR);
 
     // The check list was already known before the link went down.
     api.pollError = null;
@@ -322,7 +344,7 @@ describe("AgentRuntime", () => {
     const api = new FakeApi();
     api.checks = [check("a", 15)];
     api.sendError = new TransientError("offline");
-    const h = harness(api);
+    const h = harness(api, undefined, undefined, undefined, FIFTEEN_SECOND_FLOOR);
 
     await h.tickAt(0);
     await h.tickAt(BACKOFF_START_MS);
@@ -517,6 +539,25 @@ describe("AgentRuntime metrics", () => {
     expect(metricsSource.watchLists).toEqual([["nginx", "postgresql"], []]);
   });
 
+  it("REA-440: arms the collector's log snapshot request only when the poll asks for one", async () => {
+    const api = new FakeApi();
+    const metricsSource = new FakeMetricsSource();
+    const h = harness(api, new ResultBuffer(), metricsSource);
+    await h.tickAt(0);
+    expect(metricsSource.logSnapshotRequests).toBe(0);
+
+    api.requestLogSnapshot = true;
+    await h.tickAt(POLL_INTERVAL_MS);
+    expect(metricsSource.logSnapshotRequests).toBe(1);
+
+    // A one-shot server flag, not a persistent setting: the runtime never
+    // disarms it itself, but a poll that no longer asks should not arm it
+    // again either.
+    api.requestLogSnapshot = false;
+    await h.tickAt(POLL_INTERVAL_MS * 2);
+    expect(metricsSource.logSnapshotRequests).toBe(1);
+  });
+
   it("a collector that throws costs one log line, never the tick", async () => {
     const api = new FakeApi();
     api.checks = [check("a", 15)];
@@ -633,6 +674,162 @@ describe("AgentRuntime metrics", () => {
     }
     expect(metricsBuffer.size).toBe(5);
     expect(metricsBuffer.dropped).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * The load bounds, section 3.4 of `docs/private-probe-locations.md`, as the
+ * loop actually applies them.
+ *
+ * Every one of these has to be LOUD when it bites. A bound that silently
+ * degrades monitoring is indistinguishable from monitoring that silently
+ * broke, which is the exact failure this whole product exists to prevent.
+ */
+describe("AgentRuntime: the load bounds", () => {
+  it("truncates a poll response over the assigned-check ceiling, and says so", async () => {
+    const api = new FakeApi();
+    api.checks = Array.from({ length: 12 }, (_, i) => check(String(i), 60));
+    const h = harness(api, undefined, undefined, undefined, { ...DEFAULT_BOUNDS, maxAssignedChecks: 10 });
+
+    await h.tickAt(0);
+    expect(h.runtime.scheduler.size).toBe(10);
+    const line = lines
+      .map((l) => JSON.parse(l) as { msg: string; dropped?: number; running?: number })
+      .find((r) => r.msg === "assigned more checks than this location accepts");
+    expect(line).toMatchObject({ dropped: 2, running: 10 });
+  });
+
+  it("says on the poll line how many cadences the floor clamped", async () => {
+    const api = new FakeApi();
+    api.checks = [check("a", 30), check("b", 300)];
+    const h = harness(api);
+
+    await h.tickAt(0);
+    const line = lines
+      .map((l) => JSON.parse(l) as { msg: string; clampedToFloor?: number; minIntervalSeconds?: number })
+      .find((r) => r.msg === "polled");
+    expect(line).toMatchObject({ clampedToFloor: 1, minIntervalSeconds: 60 });
+  });
+
+  it("leaves the poll line quiet when no bound bit", async () => {
+    // The "only present when it happened" convention: a grep for one of these
+    // fields has to find real events and nothing else.
+    const api = new FakeApi();
+    api.checks = [check("a", 60)];
+    const h = harness(api);
+
+    await h.tickAt(0);
+    const line = lines.map((l) => JSON.parse(l) as Record<string, unknown>).find((r) => r.msg === "polled");
+    expect(line).not.toHaveProperty("clampedToFloor");
+    expect(line).not.toHaveProperty("droppedOverCeiling");
+    expect(line).not.toHaveProperty("egressWouldRefuse");
+  });
+
+  it("holds the concurrency ceiling when a tick's worth of checks all come due", async () => {
+    const api = new FakeApi();
+    api.checks = Array.from({ length: 20 }, (_, i) => check(String(i), 60));
+    let inFlight = 0;
+    let peak = 0;
+    const runtime = new AgentRuntime({
+      api,
+      bounds: { ...DEFAULT_BOUNDS, maxConcurrentProbes: 3 },
+      now: () => 0,
+      execute: async (c: AgentCheck) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        inFlight--;
+        return { checkId: c.id, ok: true, latencyMs: 1, checkedAt: new Date(0).toISOString() };
+      },
+    });
+
+    await runtime.tick();
+    expect(peak).toBe(3);
+    // Flushed inside the same tick, so the evidence that all 20 ran is what
+    // the api received, not what is still queued.
+    expect(api.sent.flat()).toHaveLength(20);
+  });
+
+  it("skips the excess over the probe budget and reports each skip as a failed result", async () => {
+    // Not silence. Silence reads as "not due yet" on the dashboard, and the
+    // customer would have no way to learn the location is over capacity.
+    const api = new FakeApi();
+    api.checks = Array.from({ length: 6 }, (_, i) => check(String(i), 60));
+    const h = harness(api, undefined, undefined, undefined, {
+      ...DEFAULT_BOUNDS,
+      maxProbesPerMinute: 4,
+    });
+
+    await h.tickAt(0);
+    const sent = api.sent.flat();
+    expect(sent).toHaveLength(6);
+    const skipped = sent.filter((r) => !r.ok);
+    expect(skipped).toHaveLength(2);
+    expect(skipped[0].error).toContain("skipped this check");
+    expect(lines.some((l) => l.includes("probe budget reached"))).toBe(true);
+  });
+
+  it("the budget recovers a window later", async () => {
+    const api = new FakeApi();
+    api.checks = [check("a", 60), check("b", 60)];
+    const h = harness(api, undefined, undefined, undefined, {
+      ...DEFAULT_BOUNDS,
+      maxProbesPerMinute: 1,
+      minIntervalSeconds: 60,
+    });
+
+    await h.tickAt(0);
+    expect(api.sent.flat().filter((r) => !r.ok)).toHaveLength(1);
+
+    api.sent.length = 0;
+    await h.tickAt(120_000);
+    // Both are due again, the window has rolled, and one probe of budget is
+    // available: one runs, one is skipped.
+    expect(api.sent.flat().filter((r) => !r.ok)).toHaveLength(1);
+    expect(api.sent.flat().filter((r) => r.ok)).toHaveLength(1);
+  });
+
+  /** MUTATION TEST: raise the budget past the work and the skips vanish. */
+  it("mutation: with the probe budget raised, nothing is skipped", async () => {
+    const api = new FakeApi();
+    api.checks = Array.from({ length: 6 }, (_, i) => check(String(i), 60));
+    const h = harness(api, undefined, undefined, undefined, {
+      ...DEFAULT_BOUNDS,
+      maxProbesPerMinute: 1_000,
+    });
+
+    await h.tickAt(0);
+    expect(api.sent.flat()).toHaveLength(6);
+    expect(api.sent.flat().filter((r) => !r.ok)).toHaveLength(0);
+  });
+});
+
+describe("AgentRuntime: the egress guard", () => {
+  it("hands the guard to every probe and drains its counts onto the poll line", async () => {
+    const api = new FakeApi();
+    api.checks = [check("a", 60)];
+    const report = new EgressReport();
+    const seen: (EgressGuard | undefined)[] = [];
+    const runtime = new AgentRuntime({
+      api,
+      now: () => 0,
+      egress: async () => ({ proceed: true, addresses: [] }),
+      egressReport: report,
+      execute: async (c: AgentCheck, egress?: EgressGuard) => {
+        seen.push(egress);
+        return { checkId: c.id, ok: true, latencyMs: 1, checkedAt: new Date(0).toISOString() };
+      },
+    });
+
+    // A refusal recorded between two polls has to show up on the second one.
+    report.record({ allow: false, enforced: false, rule: "public", detail: "x" });
+    await runtime.tick();
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBeTypeOf("function");
+    const line = lines
+      .map((l) => JSON.parse(l) as { msg: string; egressWouldRefuse?: number })
+      .find((r) => r.msg === "polled");
+    expect(line?.egressWouldRefuse).toBe(1);
   });
 });
 

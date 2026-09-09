@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { DockerEngineClient } from "./collect-docker.ts";
 import { HOST_MOUNT_ROOT, LinuxCollector } from "./collect-linux.ts";
 import { linuxBaseline, statLine } from "./testdata/fake-platform.ts";
 
@@ -93,6 +94,68 @@ describe("LinuxCollector: the four v2 families, from files only", () => {
     expect(sample.containers).toEqual([
       { id, name: null, runtime: "docker", cpuRatio: 0.1, memoryUsedBytes: 104_857_600, memoryLimitBytes: null },
       { id: "b".repeat(64), name: null, runtime: "kubernetes", cpuRatio: 0, memoryUsedBytes: 2048, memoryLimitBytes: 536_870_912 },
+    ]);
+  });
+
+  it("enriches a Docker container with the daemon's own name/image/state/restarts/health over the socket (REA-440)", async () => {
+    const p = linuxBaseline();
+    const id = "a".repeat(64);
+    p.addTree("/sys/fs/cgroup", {
+      "cgroup.controllers": "cpu memory",
+      [`system.slice/docker-${id}.scope/cpu.stat`]: "usage_usec 1000000\n",
+      [`system.slice/docker-${id}.scope/memory.current`]: "104857600\n",
+      [`system.slice/docker-${id}.scope/memory.max`]: "max\n",
+    });
+    const docker = new DockerEngineClient({
+      existsSync: () => true,
+      request: async () =>
+        JSON.stringify({
+          Name: "/web-1",
+          Config: { Image: "nginx:1.27" },
+          State: { Status: "running", Health: { Status: "healthy" } },
+          RestartCount: 3,
+        }),
+    });
+    const c = new LinuxCollector(p, warn, docker);
+    p.clock = 0;
+    await c.collect([]);
+    p.clock = 10_000;
+    p.files.set("/proc/stat", statLine(1200, 8900, 2));
+    const sample = (await c.collect([]))!;
+    expect(sample.containers).toEqual([
+      {
+        id,
+        name: "web-1",
+        runtime: "docker",
+        cpuRatio: expect.any(Number),
+        memoryUsedBytes: 104_857_600,
+        memoryLimitBytes: null,
+        image: "nginx:1.27",
+        state: "running",
+        restartCount: 3,
+        health: "healthy",
+      },
+    ]);
+  });
+
+  it("leaves the cgroup-only container reading unchanged when the Docker socket is absent", async () => {
+    const p = linuxBaseline();
+    const id = "a".repeat(64);
+    p.addTree("/sys/fs/cgroup", {
+      "cgroup.controllers": "cpu memory",
+      [`system.slice/docker-${id}.scope/cpu.stat`]: "usage_usec 1000000\n",
+      [`system.slice/docker-${id}.scope/memory.current`]: "104857600\n",
+      [`system.slice/docker-${id}.scope/memory.max`]: "max\n",
+    });
+    const docker = new DockerEngineClient({ existsSync: () => false });
+    const c = new LinuxCollector(p, warn, docker);
+    p.clock = 0;
+    await c.collect([]);
+    p.clock = 10_000;
+    p.files.set("/proc/stat", statLine(1200, 8900, 2));
+    const sample = (await c.collect([]))!;
+    expect(sample.containers).toEqual([
+      { id, name: null, runtime: "docker", cpuRatio: expect.any(Number), memoryUsedBytes: 104_857_600, memoryLimitBytes: null },
     ]);
   });
 

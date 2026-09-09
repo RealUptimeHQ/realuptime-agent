@@ -183,3 +183,71 @@ describe("runHttpCheck", () => {
     expect(httpRules.isUp(500)).toBe(false);
   });
 });
+
+describe("runHttpCheck: the egress guard", () => {
+  it("never sends the request when the guard refuses", async () => {
+    let requests = 0;
+    const url = await serve((_req, res) => {
+      requests++;
+      res.writeHead(200).end();
+    });
+    const out = await runHttpCheck(url, undefined, undefined, undefined, async () => ({
+      proceed: false,
+      error: "Blocked by this location's local policy (public address)",
+      addresses: [],
+    }));
+    expect(requests).toBe(0);
+    expect(out.ok).toBe(false);
+    expect(out.error).toBe("Blocked by this location's local policy (public address)");
+  });
+
+  it("is asked again on every redirect hop", async () => {
+    // A redirect is a dial at a host the first verdict never saw. Checking
+    // once at the top of the chain is the classic hole in this shape.
+    const final = await serve((_req, res) => res.writeHead(200).end());
+    const start = await serve((_req, res) => res.writeHead(302, { location: final }).end());
+    const asked: string[] = [];
+    const out = await runHttpCheck(start, undefined, undefined, undefined, async (host, port) => {
+      asked.push(`${host}:${port}`);
+      return { proceed: true, addresses: [] };
+    });
+    expect(out.ok).toBe(true);
+    expect(asked).toHaveLength(2);
+  });
+
+  it("refuses a redirect the first hop was allowed to make", async () => {
+    const final = await serve((_req, res) => res.writeHead(200).end());
+    const start = await serve((_req, res) => res.writeHead(302, { location: final }).end());
+    let hop = 0;
+    const out = await runHttpCheck(start, undefined, undefined, undefined, async () => {
+      hop++;
+      return hop === 1
+        ? { proceed: true, addresses: [] }
+        : { proceed: false, error: "Blocked by this location's local policy (public address)", addresses: [] };
+    });
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain("Blocked by this location's local policy");
+  });
+
+  it("resolves the default port, so a rule naming 443 sees an https target", async () => {
+    const asked: (number | null)[] = [];
+    await runHttpCheck("https://host.invalid/health", 500, undefined, undefined, async (_host, port) => {
+      asked.push(port);
+      return { proceed: false, error: "no", addresses: [] };
+    });
+    await runHttpCheck("http://host.invalid/health", 500, undefined, undefined, async (_host, port) => {
+      asked.push(port);
+      return { proceed: false, error: "no", addresses: [] };
+    });
+    await runHttpCheck("http://host.invalid:8080/health", 500, undefined, undefined, async (_host, port) => {
+      asked.push(port);
+      return { proceed: false, error: "no", addresses: [] };
+    });
+    expect(asked).toEqual([443, 80, 8080]);
+  });
+
+  it("without a guard, behaves exactly as it did before one existed", async () => {
+    const url = await serve((_req, res) => res.writeHead(200).end());
+    expect((await runHttpCheck(url)).ok).toBe(true);
+  });
+});

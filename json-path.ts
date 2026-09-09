@@ -30,8 +30,8 @@
  *
  * A path expression is a customer-authored ADDRESS. `data.items[0].status`
  * is a finite list of literal key and index segments, walked exactly once
- * against an already-parsed object. Cost is O(number of segments) — bounded
- * below by MAX_PATH_SEGMENTS — and is independent of the size of the body.
+ * against an already-parsed object. Cost is O(number of segments), bounded
+ * below by MAX_PATH_SEGMENTS, and is independent of the size of the body.
  * There is no alternation, no repetition operator and no branch for a
  * customer to weaponise, because the grammar below has none.
  *
@@ -39,7 +39,7 @@
  *
  * Wildcards (`[*]`, `.*`), filter expressions (`[?(@.x > 1)]`) and recursive
  * descent (`$..name`) are the parts of the JSONPath standard that put SEARCH
- * — and, for filters, expression evaluation — back into what is otherwise a
+ *, and, for filters, expression evaluation, back into what is otherwise a
  * lookup. All three are out.
  *
  * They are REFUSED rather than ignored. A parser that silently dropped a
@@ -306,7 +306,7 @@ export type JsonAssertionResult = { ok: true } | { ok: false; reason: string };
  *
  * The ONE implementation the fleet uses for both a whole http check
  * (`http-assertions.ts`) and a single journey step
- * (`probe-multistep.ts`) — those two mirror each other's status/body/header
+ * (`probe-multistep.ts`), those two mirror each other's status/body/header
  * logic by hand for historical reasons, but there was no reason to start a
  * third hand-mirrored copy here, and both live in this package and can
  * simply import this. `apps/agent/json-path.ts` remains a duplicate because
@@ -315,7 +315,7 @@ export type JsonAssertionResult = { ok: true } | { ok: false; reason: string };
  *
  * `bodyTruncated` matters more than it looks. A body cut off at the 256KB
  * cap is almost never parseable JSON, and reporting that as "the response
- * body is not valid JSON" would be a lie about the customer's API — their
+ * body is not valid JSON" would be a lie about the customer's API, their
  * JSON is fine, ours is the limitation. The two cases get different reasons.
  */
 export function evaluateJsonAssertion(
