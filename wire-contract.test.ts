@@ -274,9 +274,24 @@ describe("wire contract", () => {
       arch: "x64",
       cluster: null,
       node: null,
+      // REA-780. Optional on the wire and null when the agent could not tell;
+      // the server coerces an unknown value to null rather than refusing the
+      // batch, so a rename here is a silent no-op in production and this
+      // assertion is what catches it.
+      networkMode: "isolated",
+      networkGateway: "172.17.0.1",
     };
     expect(Object.keys(host).sort()).toEqual(
-      ["arch", "cluster", "hostname", "node", "os", "osVersion"].sort(),
+      [
+        "arch",
+        "cluster",
+        "hostname",
+        "networkGateway",
+        "networkMode",
+        "node",
+        "os",
+        "osVersion",
+      ].sort(),
     );
     const poll: Required<PollResponse> = { checks: [], services: [], requestLogSnapshot: false };
     expect(Object.keys(poll).sort()).toEqual(["checks", "requestLogSnapshot", "services"].sort());

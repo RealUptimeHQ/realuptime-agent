@@ -16,7 +16,7 @@
 # `sha256sum install.sh`), so a change here without regenerating that
 # checksum fails the suite rather than shipping a script whose published
 # hash no longer matches what `curl | sh` actually fetches.
-INSTALLER_SCRIPT_VERSION="3"
+INSTALLER_SCRIPT_VERSION="4"
 #
 # What it does, in order, and nothing else:
 #   1. Picks a method: Docker if the docker CLI is present and usable (the
@@ -177,9 +177,18 @@ fi
 [ -n "$TOKEN" ] || die "no token. Pass --token rua_... (shown once when you register the agent in the dashboard)."
 case "$TOKEN" in rua_*) ;; *) die "that does not look like an agent token (expected rua_...)";; esac
 
+METHOD_CHOSEN_BY_US=0
 if [ -z "$METHOD" ]; then
+  METHOD_CHOSEN_BY_US=1
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then METHOD=docker; else METHOD=systemd; fi
 fi
+
+# Node.js 22+ present: the systemd path can run on this host.
+node_ok() {
+  command -v node >/dev/null 2>&1 || return 1
+  major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  [ "${major:-0}" -ge 22 ] 2>/dev/null
+}
 
 env_lines() {
   printf 'REALUPTIME_TOKEN=%s\n' "$TOKEN"
@@ -219,12 +228,27 @@ install_docker() {
   # `docker login`) surfaces here as a bare docker error unless it is
   # translated (REA-601): captured rather than streamed so the exact text
   # can be matched, never printed as noise on the success path.
-  if run_out="$(docker run -d --name realuptime-agent --restart unless-stopped --env-file "$tmp" "$IMAGE" 2>&1)"; then
+  # --network host, REA-780. An agent watching its own host has to share that
+  # host's network: on the default bridge, 127.0.0.1 inside the container is
+  # the CONTAINER, so every check a customer points at a host-local service is
+  # refused forever while the service is healthy. Measured on our own account,
+  # one such check produced 2,819 failures against 22 successes in a day. This
+  # installer's whole job is to put the agent where it can see the machine, so
+  # the flag is part of the command and not a documented option.
+  if run_out="$(docker run -d --name realuptime-agent --restart unless-stopped --network host --env-file "$tmp" "$IMAGE" 2>&1)"; then
     rm -f "$tmp"
   else
     rm -f "$tmp"
     case "$run_out" in
       *unauthorized*|*denied*)
+        # Docker was our pick, not the customer's, and the host can run the
+        # agent without it: install that way instead of stopping (REA-841).
+        # A customer who asked for --method docker still gets the error.
+        if [ "$METHOD_CHOSEN_BY_US" = 1 ] && node_ok; then
+          say "could not pull $IMAGE (the registry denied it); installing as a systemd service instead"
+          install_systemd
+          return
+        fi
         die "could not pull $IMAGE: the registry denied the request. This means the image is not public yet, or your \`docker login ghcr.io\` lost read access to it -- it is not this host's fault. Ask RealUptime to confirm ghcr.io/realuptimehq/agent is public, or install with --method systemd instead (needs Node.js 22+, no Docker). Raw error: $run_out" ;;
       *) die "docker run failed: $run_out" ;;
     esac

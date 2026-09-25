@@ -42,9 +42,20 @@ Docker, one command (works once the package above is public):
 
 ```
 docker run -d --name realuptime-agent --restart unless-stopped \
+  --network host \
   -e REALUPTIME_TOKEN=rua_your_token_here \
   ghcr.io/realuptimehq/agent:latest
 ```
+
+`--network host` is part of the command, not an option (REA-780). An agent
+watching its own host has to share that host's network: without the flag the
+container gets a network of its own, `127.0.0.1` inside it is the container,
+and every check pointed at a host-local service is refused forever while the
+service is healthy. Drop it only when the container itself is what you mean
+to watch. The agent detects the isolated case from `/sys/class/net` and
+`/proc/net/route` (`host-network.ts`), logs it at startup, and reports it
+with its host identity so the dashboard can explain the refusal instead of
+repeating it.
 
 The token is shown once, when you register the agent in the RealUptime
 dashboard. If you lose it, issue a new one: tokens are stored hashed, so

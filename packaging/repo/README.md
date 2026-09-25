@@ -1,9 +1,9 @@
 # apt and yum repository layout (REA-181)
 
-Packaging scripts only. Nothing here publishes; the lead runs these steps by
-hand and the host (`pkg.realuptime.io`) does not exist until the owner says
-so. Written down so the layout is decided once, before the first package,
-rather than improvised at publish time.
+Packaging scripts only. Nothing here publishes; these steps are run by
+hand and the host (`pkg.realuptime.io`) does not exist yet. Written down so
+the layout is decided once, before the first package, rather than
+improvised at publish time.
 
 ## Artifacts
 

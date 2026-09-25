@@ -165,8 +165,35 @@ describe("MetricsCollector", () => {
       arch: "x64",
       cluster: "prod-eu",
       node: "fixture-host",
+      // REA-780: the baseline fixture is not a container, so the network
+      // question is settled without reading an interface, and no gateway is
+      // ever offered for a host-networked agent. See host-network.test.ts for
+      // the bridge and host-networking fixtures.
+      networkMode: "host",
+      networkGateway: null,
     });
     expect(await collector.hostInfo()).toBe(info); // cached
+  });
+
+  // REA-780: the wiring, end to end through the collector. The detection
+  // rules themselves are exercised against every fixture in
+  // host-network.test.ts; this proves the answer actually reaches the batch
+  // header, which is the only way the dashboard ever learns it.
+  it("carries the network mode and the docker gateway on the host header from inside a bridge container", async () => {
+    const platform = linuxBaseline();
+    platform.exists.add("/.dockerenv");
+    platform.dirs.set("/sys/class/net", ["lo", "eth0"]);
+    platform.files.set("/sys/class/net/lo/ifindex", "1\n");
+    platform.files.set("/sys/class/net/lo/iflink", "1\n");
+    platform.files.set("/sys/class/net/eth0/ifindex", "12\n");
+    platform.files.set("/sys/class/net/eth0/iflink", "13\n");
+    platform.files.set(
+      "/proc/net/route",
+      "Iface\tDestination\tGateway\neth0\t00000000\t010011AC\t0003\t0\t0\t0\t00000000\n",
+    );
+    const collector = new MetricsCollector({ platform, gpu: NO_GPU });
+    const info = await collector.hostInfo();
+    expect(info).toMatchObject({ networkMode: "isolated", networkGateway: "172.17.0.1" });
   });
 
   describe("vantage()", () => {

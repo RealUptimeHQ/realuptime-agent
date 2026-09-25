@@ -1,5 +1,7 @@
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -91,6 +93,22 @@ describe("installers", () => {
     expect(sh).toMatch(/verify_image "\$IMAGE"/);
   });
 
+  // REA-780. The installer's Docker path is the one most customers get, and
+  // without host networking 127.0.0.1 inside the container is the container:
+  // every check pointed at a host-local service is refused forever while the
+  // service is healthy (2,819 false failures against 22 successes in a day on
+  // our own account). Pinned on the same `docker run` line the signature test
+  // above already locates, so the flag cannot be dropped silently.
+  it("the Docker install path gives the agent the host's network", () => {
+    const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
+    const runLine = sh
+      .split("\n")
+      .find((line) => line.includes("docker run -d --name realuptime-agent"));
+    expect(runLine).toBeDefined();
+    expect(runLine).toContain("--network host");
+    expect(sh).toContain("REA-780");
+  });
+
   it("the Windows installer verifies the checksum and runs the agent as LOCAL SERVICE under Task Scheduler", () => {
     const ps = readFileSync(join(HERE, "install", "install-windows.ps1"), "utf8");
     expect(ps).toContain("checksum mismatch");
@@ -176,5 +194,49 @@ describe("installers", () => {
     expect(yaml).toContain("runAsNonRoot: true");
     expect(yaml).toContain("readOnlyRootFilesystem: true");
     expect(yaml).not.toContain("privileged: true");
+  });
+});
+
+/**
+ * REA-841: the Docker path is the default whenever Docker is present, and a
+ * registry that denies the image pull used to end the install. When Docker
+ * was the installer's own pick and Node.js 22 is on the host, it now falls
+ * back to the systemd path; an explicit `--method docker` still stops with
+ * the explanation. Fake `docker` and `node` on PATH; the systemd path is only
+ * followed as far as its first download, which the fake `curl` fails.
+ */
+describe("install.sh when the agent image cannot be pulled (REA-841)", () => {
+  function fakeBin(): string {
+    const dir = mkdtempSync(join(tmpdir(), "agent-install-"));
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const write = (name: string, body: string) => {
+      writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
+      chmodSync(join(bin, name), 0o755);
+    };
+    write("docker", 'case "$1" in info) exit 0;; rm) exit 0;; run) echo "Error response from daemon: denied: requested access to the resource is denied" >&2; exit 1;; esac; exit 0');
+    write("node", 'echo 22');
+    write("curl", "exit 22");
+    write("cosign", "exit 1");
+    return bin;
+  }
+  function run(args: string[]) {
+    return spawnSync("sh", [join(HERE, "install", "install.sh"), "--token", "rua_test", ...args], {
+      encoding: "utf8",
+      env: { PATH: `${fakeBin()}:/usr/bin:/bin`, HOME: tmpdir() },
+    });
+  }
+
+  it("falls back to the systemd install when Docker was its own pick", () => {
+    const result = run([]);
+    expect(result.stdout + result.stderr).toContain("installing as a systemd service instead");
+  });
+
+  it("stops with the explanation when the customer asked for Docker", () => {
+    const result = run(["--method", "docker"]);
+    const out = result.stdout + result.stderr;
+    expect(result.status).not.toBe(0);
+    expect(out).toContain("could not pull");
+    expect(out).not.toContain("installing as a systemd service instead");
   });
 });

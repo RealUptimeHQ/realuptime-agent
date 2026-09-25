@@ -390,6 +390,13 @@ export interface LogSnapshot {
 
 export type HostOs = "linux" | "darwin" | "windows" | "other";
 
+/** REA-780. Defined here rather than imported from `host-network.ts` for the
+ * same reason every other type in this file is duplicated: this is the wire
+ * contract, and it must be readable without following an import into the
+ * collector. `host-network.ts` re-states it and `wire-contract.test.ts` pins
+ * both. */
+export type HostNetworkMode = "host" | "isolated";
+
 /** Identity of the reporting host, sent on every v2 batch (it is cheap and
  * makes the batch self-describing when read months later). `cluster` and
  * `node` are the two optional labels the dashboard's cluster view groups
@@ -402,6 +409,18 @@ export interface HostInfo {
   arch: string;
   cluster: string | null;
   node: string | null;
+  /** REA-780: whether this process shares the machine's network ("host") or
+   * has one of its own ("isolated"), from `host-network.ts`. Null means the
+   * agent could not tell, and the server and dashboard then say nothing at
+   * all: this field exists to explain a specific failure, and a wrong
+   * explanation is worse than none. An agent older than REA-780 omits it,
+   * which reads the same as null. */
+  networkMode?: HostNetworkMode | null;
+  /** REA-780: the default gateway of an ISOLATED namespace, which is the
+   * address the host answers on from inside the container (172.17.0.1 for
+   * Docker's default bridge). Null on a host-networked agent, where it is
+   * merely the machine's own router and means nothing. */
+  networkGateway?: string | null;
 }
 
 /** One instant's server health. */

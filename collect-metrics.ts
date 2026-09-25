@@ -13,6 +13,12 @@ import { RedisCollector } from "./collect-redis.ts";
 import { normalizeWatchList } from "./collect-services.ts";
 import { WindowsCollector } from "./collect-windows.ts";
 import { log } from "./log.ts";
+import {
+  detectHostNetwork,
+  isolatedNetworkHint,
+  readHostNetworkEvidence,
+  type HostNetworkResult,
+} from "./host-network.ts";
 import { RealHostPlatform, type HostPlatform } from "./platform.ts";
 import type { VantageResult } from "./vantage.ts";
 import type {
@@ -141,6 +147,7 @@ export class MetricsCollector {
   private availableCache: boolean | null = null;
   private serviceWatch: string[] = [];
   private hostInfoCache: HostInfo | null = null;
+  private hostNetworkCache: HostNetworkResult | null = null;
   private readonly warned = new Set<string>();
 
   constructor(options: MetricsCollectorOptions = {}) {
@@ -291,6 +298,7 @@ export class MetricsCollector {
     if (!this.collector) return null;
     try {
       const base = await this.collector.hostInfo();
+      const network = this.hostNetwork();
       this.hostInfoCache = {
         hostname: base.hostname,
         os: base.os,
@@ -298,11 +306,40 @@ export class MetricsCollector {
         arch: base.arch,
         cluster: this.cluster,
         node: this.node ?? base.hostname,
+        networkMode: network.mode,
+        networkGateway: network.gateway,
       };
       return this.hostInfoCache;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * REA-780: whether this process shares the machine's network. Detected once
+   * (the evidence cannot change while the process runs) and logged once, at
+   * warn, when it is the trap: an operator reading `docker logs
+   * realuptime-agent` gets the answer without opening the dashboard, and the
+   * dashboard gets it on the next metrics batch. Never fatal and never a
+   * guess; see host-network.ts.
+   */
+  private hostNetwork(): HostNetworkResult {
+    if (this.hostNetworkCache) return this.hostNetworkCache;
+    let result: HostNetworkResult;
+    try {
+      result = detectHostNetwork(readHostNetworkEvidence(this.platform));
+    } catch {
+      result = { mode: null, evidence: "unknown", gateway: null };
+    }
+    this.hostNetworkCache = result;
+    if (result.mode === "isolated") {
+      log("warn", "this agent's container has its own network, so localhost is the container", {
+        evidence: result.evidence,
+        gateway: result.gateway ?? undefined,
+        hint: isolatedNetworkHint(result.gateway),
+      });
+    }
+    return result;
   }
 
   private available(): boolean {
