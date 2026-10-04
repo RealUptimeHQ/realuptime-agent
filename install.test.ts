@@ -218,6 +218,7 @@ describe("install.sh when the agent image cannot be pulled (REA-841)", () => {
     write("node", 'echo 22');
     write("curl", "exit 22");
     write("cosign", "exit 1");
+    write("uname", "echo Linux");
     return bin;
   }
   function run(args: string[]) {
@@ -238,5 +239,111 @@ describe("install.sh when the agent image cannot be pulled (REA-841)", () => {
     expect(result.status).not.toBe(0);
     expect(out).toContain("could not pull");
     expect(out).not.toContain("installing as a systemd service instead");
+  });
+});
+
+/**
+ * The installer must not choose Docker when the image cannot be pulled. The
+ * auto-pick used to look only at whether the docker CLI answered, so a host
+ * whose pull would fail (a registry that denies it, an architecture the image
+ * does not carry, no route to ghcr.io) was sent down the Docker path and
+ * recovered only after `docker run` had failed. Now the pick itself pulls
+ * first, and falls back to the release binary with a message that names why.
+ * Fake `docker`, `node`, `curl` and `uname` on PATH; the binary path is only
+ * followed as far as its first download, which the fake `curl` fails.
+ */
+describe("install.sh picks a method by what can actually be done", () => {
+  function fakeEnv(opts: { pull: "ok" | "denied" | "arch" | "offline"; node?: boolean; os?: string }) {
+    const dir = mkdtempSync(join(tmpdir(), "agent-install-pick-"));
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const ran = join(dir, "docker-run-called");
+    const write = (name: string, body: string) => {
+      writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
+      chmodSync(join(bin, name), 0o755);
+    };
+    const pullBody = {
+      ok: "exit 0",
+      denied: 'echo "Error response from daemon: denied: requested access to the resource is denied" >&2; exit 1',
+      arch: 'echo "no matching manifest for linux/arm64/v8 in the manifest list entries" >&2; exit 1',
+      offline: 'echo "dial tcp: lookup ghcr.io: no such host" >&2; exit 1',
+    }[opts.pull];
+    // `docker run` pulls a missing image itself, so it fails exactly when a pull would.
+    const runBody =
+      opts.pull === "ok"
+        ? `: > "${ran}"; echo cid; exit 0`
+        : 'echo "Error response from daemon: denied: requested access to the resource is denied" >&2; exit 1';
+    write(
+      "docker",
+      `case "$1" in info) exit 0;; pull) ${pullBody};; rm) exit 0;; run) ${runBody};; esac; exit 0`,
+    );
+    if (opts.node !== false) write("node", "echo 22");
+    write("curl", "exit 22");
+    write("cosign", "exit 1");
+    write("uname", `echo ${opts.os ?? "Linux"}`);
+    write("launchctl", "exit 0");
+    write("sudo", 'exec "$@"');
+    return { bin, ran };
+  }
+  function run(env: ReturnType<typeof fakeEnv>, args: string[] = []) {
+    const result = spawnSync("sh", [join(HERE, "install", "install.sh"), "--token", "rua_test", ...args], {
+      encoding: "utf8",
+      env: { PATH: `${env.bin}:/usr/bin:/bin`, HOME: tmpdir() },
+    });
+    return { out: result.stdout + result.stderr, status: result.status, dockerRan: existsSync(env.ran) };
+  }
+
+  it("uses Docker when the image pulls", () => {
+    const result = run(fakeEnv({ pull: "ok" }));
+    expect(result.dockerRan).toBe(true);
+    expect(result.out).toContain("installing with Docker");
+    expect(result.status).toBe(0);
+  });
+
+  it.each([
+    ["a registry that denies the pull", "denied"],
+    ["an architecture the image does not carry", "arch"],
+    ["no route to the registry", "offline"],
+  ] as const)("does not choose Docker for %s, and installs the binary instead", (_label, pull) => {
+    const result = run(fakeEnv({ pull }));
+    expect(result.dockerRan).toBe(false);
+    expect(result.out).not.toContain("installing with Docker");
+    expect(result.out).toContain("could not pull ghcr.io/realuptimehq/agent:latest");
+    expect(result.out).toContain("installing the release binary instead");
+  });
+
+  it("names both problems when the image cannot be pulled and Node.js 22+ is missing", () => {
+    const result = run(fakeEnv({ pull: "denied", node: false }));
+    expect(result.dockerRan).toBe(false);
+    expect(result.status).not.toBe(0);
+    expect(result.out).toContain("could not pull ghcr.io/realuptimehq/agent:latest");
+    expect(result.out).toContain("Node.js 22");
+  });
+
+  it("an explicit --method docker still tries Docker and stops with the explanation", () => {
+    const result = run(fakeEnv({ pull: "denied" }), ["--method", "docker"]);
+    expect(result.status).not.toBe(0);
+    expect(result.out).toContain("could not pull");
+  });
+
+  it("on macOS it installs the release binary as a launchd daemon, never Docker", () => {
+    const result = run(fakeEnv({ pull: "ok", os: "Darwin" }));
+    expect(result.dockerRan).toBe(false);
+    expect(result.out).toContain("installing the release binary as a launchd daemon");
+  });
+});
+
+describe("install.sh on macOS", () => {
+  const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
+
+  it("runs the daemon as an unprivileged user, with the token in a file only that user can read", () => {
+    expect(sh).toContain("io.realuptime.agent");
+    expect(sh).toContain("<key>UserName</key>");
+    expect(sh).toMatch(/chown nobody/);
+    expect(sh).not.toMatch(/<key>REALUPTIME_TOKEN<\/key>/);
+  });
+
+  it("checks the release checksum with shasum when sha256sum is absent", () => {
+    expect(sh).toContain("shasum -a 256");
   });
 });

@@ -15,36 +15,22 @@ Windows Server.
 
 ## Install
 
-One line, Linux (Docker if present, otherwise a hardened systemd service under
-your existing Node.js 22+):
+One line, Linux (Docker when the agent image can be pulled, otherwise the
+release binary as a hardened systemd service under your existing Node.js 22+):
 
 ```
-curl -fsSL https://realuptime.io/agent/install.sh | sh -s -- --token rua_your_token_here
+curl -fsSL https://realuptime.io/agent/install.sh | REALUPTIME_TOKEN=rua_your_token_here sh
 ```
 
-**The `ghcr.io/realuptimehq/agent` package is not public yet** (REA-601).
-Until RealUptime flips that in GitHub's package settings, an anonymous
-`docker pull` or `docker run` against it fails with `unauthorized` -- which
-includes the Docker half of the one-liner above, on any host where Docker is
-already installed and usable, since that is the path it picks by default.
-`install.sh` says exactly this (not a bare docker error) when a pull is
-denied, and names the fix: force the systemd install instead, which needs
-only Node.js 22+ and no Docker at all:
+When the installer cannot pull the image (the registry denies the pull, the
+host's architecture is not one the image carries, no route to `ghcr.io`) it
+says so and installs the release binary instead, which needs only Node.js 22+
+and no Docker. `--method systemd` skips Docker even where it works.
+
+Docker, one command:
 
 ```
-curl -fsSL https://realuptime.io/agent/install.sh | sh -s -- --token rua_your_token_here --method systemd
-```
-
-Once the package is public, both paths work with no flag needed, and this
-note goes away.
-
-Docker, one command (works once the package above is public):
-
-```
-docker run -d --name realuptime-agent --restart unless-stopped \
-  --network host \
-  -e REALUPTIME_TOKEN=rua_your_token_here \
-  ghcr.io/realuptimehq/agent:latest
+docker run -d --name realuptime-agent --restart unless-stopped --network host -e REALUPTIME_TOKEN=rua_your_token_here ghcr.io/realuptimehq/agent:latest
 ```
 
 `--network host` is part of the command, not an option (REA-780). An agent
@@ -113,8 +99,14 @@ already run WinSW, pointing it at `node.exe dist\agent.js` works the same.
 
 ### macOS
 
-Install Node.js 22+, download the release tarball, and run it under `launchd`
-or the supervisor you already use:
+With Node.js 22+ installed, the same installer sets the release binary up as a
+`launchd` daemon that starts at boot:
+
+```
+curl -fsSL https://realuptime.io/agent/install.sh | REALUPTIME_TOKEN=rua_your_token_here sh
+```
+
+From source, under whatever supervisor you already use:
 
 ```
 REALUPTIME_TOKEN=rua_your_token_here node dist/agent.js

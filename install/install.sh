@@ -1,5 +1,5 @@
 #!/bin/sh
-# RealUptime Monitor agent: one-line installer for Linux (REA-181, REA-454, REA-601).
+# RealUptime Monitor agent: one-line installer for Linux and macOS (REA-181, REA-454, REA-601).
 #
 #   curl -fsSL https://realuptime.io/agent/install.sh | REALUPTIME_TOKEN=rua_... sh
 #
@@ -16,15 +16,18 @@
 # `sha256sum install.sh`), so a change here without regenerating that
 # checksum fails the suite rather than shipping a script whose published
 # hash no longer matches what `curl | sh` actually fetches.
-INSTALLER_SCRIPT_VERSION="4"
+INSTALLER_SCRIPT_VERSION="5"
 #
 # What it does, in order, and nothing else:
-#   1. Picks a method: Docker if the docker CLI is present and usable (the
-#      documented default), otherwise a systemd service running the release
-#      tarball under Node.js 22+ that is already installed. The Node
-#      version is checked FIRST on the systemd path, before any network
-#      call, so a host with neither Docker nor Node 22+ fails immediately
-#      with a clear message instead of after a download (REA-601).
+#   1. Picks a method by what can actually be done on this host. On macOS
+#      that is a launchd daemon running the release tarball under the
+#      Node.js 22+ already installed. On Linux it is Docker when the docker
+#      CLI is usable AND the agent image pulls (the pull happens here, at the
+#      pick, so a registry that denies it, a host architecture the image does
+#      not carry, or no route to ghcr.io never sends the install down a path
+#      that cannot finish), otherwise a systemd service running the release
+#      tarball under Node.js 22+. A host that can do neither fails
+#      immediately with a message naming both problems, before any download.
 #   2. Systemd path: resolves the release tag from the PUBLIC mirror
 #      repository's own releases via the GitHub API, filtered to `agent-*`
 #      tags (REA-601 -- never the monorepo's own `/releases/latest`: that
@@ -42,7 +45,7 @@ INSTALLER_SCRIPT_VERSION="4"
 #      systemd path always has for a missing cosign binary. Either way this
 #      is a courtesy check, never a hard gate: an unverifiable image still
 #      runs, the same as an unsigned one always has. A pull the registry
-#      denies (the image is not public yet, or a stale `docker login`) fails
+#      denies (no read access for this host, or a stale `docker login`) fails
 #      with a message naming exactly that and how to fall back to
 #      --method systemd, not a bare docker error (REA-601).
 #   3. Installs under /opt/realuptime-agent, creates an unprivileged system
@@ -58,13 +61,14 @@ INSTALLER_SCRIPT_VERSION="4"
 # Flags:
 #   --token TOKEN        the rua_... agent token (required, or REALUPTIME_TOKEN)
 #   --url URL            override the RealUptime origin (self-hosted/staging)
-#   --method docker|systemd   force a method instead of auto-detecting
+#   --method docker|systemd|launchd   force a method instead of auto-detecting
+#                        (launchd is macOS only)
 #   --cluster NAME       optional cluster label (REALUPTIME_CLUSTER)
 #   --node NAME          optional node label (REALUPTIME_NODE), default hostname
 #   --version VER        pin a release (default: latest, or REALUPTIME_AGENT_VERSION)
 #   --print-version      resolve and print the release tag this run would
 #                        install, then exit; no token needed, nothing installed
-#   --uninstall          stop and remove the systemd install (keeps nothing)
+#   --uninstall          stop and remove the systemd or launchd install
 #
 # The source of truth for this file is apps/agent/install/install.sh in the
 # repository; apps/web/public/agent/install.sh is a byte-identical copy served
@@ -80,11 +84,19 @@ RELEASE_BASE="${REALUPTIME_RELEASE_BASE:-https://github.com/${MIRROR_REPO}/relea
 MIRROR_API_BASE="${REALUPTIME_AGENT_API_BASE:-https://api.github.com/repos/${MIRROR_REPO}}"
 COSIGN_KEY_URL="https://realuptime.io/.well-known/cosign.pub"
 IMAGE="ghcr.io/realuptimehq/agent:latest"
+OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
 INSTALL_DIR="/opt/realuptime-agent"
 ENV_DIR="/etc/realuptime-agent"
 ENV_FILE="$ENV_DIR/env"
 UNIT_FILE="/etc/systemd/system/realuptime-agent.service"
 SERVICE_USER="realuptime-agent"
+# macOS: the same release under the paths macOS expects for a local daemon.
+MAC_INSTALL_DIR="/usr/local/lib/realuptime-agent"
+MAC_ENV_DIR="/usr/local/etc/realuptime-agent"
+MAC_ENV_FILE="$MAC_ENV_DIR/env"
+MAC_LABEL="io.realuptime.agent"
+MAC_PLIST="/Library/LaunchDaemons/$MAC_LABEL.plist"
+MAC_LOG="/var/log/realuptime-agent.log"
 
 TOKEN="${REALUPTIME_TOKEN:-}"
 URL="${REALUPTIME_URL:-}"
@@ -109,13 +121,20 @@ while [ $# -gt 0 ]; do
     --version) VERSION="$2"; shift 2 ;;
     --print-version) PRINT_VERSION=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
-    -h|--help) sed -n '2,67p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,71p' "$0"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
 
 as_root() {
   if [ "$(id -u)" -eq 0 ]; then "$@"; else need sudo; sudo "$@"; fi
+}
+
+uninstall_launchd() {
+  as_root launchctl bootout "system/$MAC_LABEL" 2>/dev/null || true
+  as_root rm -f "$MAC_PLIST"
+  as_root rm -rf "$MAC_INSTALL_DIR" "$MAC_ENV_DIR"
+  say "removed the launchd install"
 }
 
 uninstall_systemd() {
@@ -165,7 +184,7 @@ resolve_agent_tag() {
 }
 
 if [ "$UNINSTALL" -eq 1 ]; then
-  uninstall_systemd
+  if [ "$OS_NAME" = "Darwin" ]; then uninstall_launchd; else uninstall_systemd; fi
   exit 0
 fi
 
@@ -177,18 +196,42 @@ fi
 [ -n "$TOKEN" ] || die "no token. Pass --token rua_... (shown once when you register the agent in the dashboard)."
 case "$TOKEN" in rua_*) ;; *) die "that does not look like an agent token (expected rua_...)";; esac
 
-METHOD_CHOSEN_BY_US=0
-if [ -z "$METHOD" ]; then
-  METHOD_CHOSEN_BY_US=1
-  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then METHOD=docker; else METHOD=systemd; fi
-fi
-
-# Node.js 22+ present: the systemd path can run on this host.
+# Node.js 22+ present: the binary install can run on this host.
 node_ok() {
   command -v node >/dev/null 2>&1 || return 1
   major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
   [ "${major:-0}" -ge 22 ] 2>/dev/null
 }
+
+# Pulls the agent image now, at the pick. A pull that works leaves the image
+# local, so the later `docker run` has nothing left to fetch; one that fails
+# records why (first line only) and answers no.
+image_pullable() {
+  pull_out="$(docker pull "$IMAGE" 2>&1)" && return 0
+  pull_why="$(printf '%s' "$pull_out" | head -n 1)"
+  return 1
+}
+
+METHOD_CHOSEN_BY_US=0
+if [ -z "$METHOD" ]; then
+  METHOD_CHOSEN_BY_US=1
+  if [ "$OS_NAME" = "Darwin" ]; then
+    METHOD=launchd
+  elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    if image_pullable; then
+      METHOD=docker
+    else
+      METHOD=systemd
+      if node_ok; then
+        say "could not pull $IMAGE (${pull_why:-no reason given}); installing the release binary instead"
+      else
+        die "could not pull $IMAGE (${pull_why:-no reason given}) and Node.js 22 or newer is not installed, so there is no way to install the agent here. Install Node.js 22+ and run this again, or fix access to the image."
+      fi
+    fi
+  else
+    METHOD=systemd
+  fi
+fi
 
 env_lines() {
   printf 'REALUPTIME_TOKEN=%s\n' "$TOKEN"
@@ -224,7 +267,7 @@ install_docker() {
   tmp="$(mktemp)"
   env_lines > "$tmp"
   # `docker run` implicitly pulls when the image is not already local, so a
-  # registry that denies the pull (image not public yet, or a stale
+  # registry that denies the pull (no read access for this host, or a stale
   # `docker login`) surfaces here as a bare docker error unless it is
   # translated (REA-601): captured rather than streamed so the exact text
   # can be matched, never printed as noise on the success path.
@@ -249,19 +292,29 @@ install_docker() {
           install_systemd
           return
         fi
-        die "could not pull $IMAGE: the registry denied the request. This means the image is not public yet, or your \`docker login ghcr.io\` lost read access to it -- it is not this host's fault. Ask RealUptime to confirm ghcr.io/realuptimehq/agent is public, or install with --method systemd instead (needs Node.js 22+, no Docker). Raw error: $run_out" ;;
+        die "could not pull $IMAGE: the registry denied the request. This means the registry is not letting this host read the image, or your \`docker login ghcr.io\` lost read access to it. Check access to ghcr.io/realuptimehq/agent, or install with --method systemd instead (needs Node.js 22+, no Docker). Raw error: $run_out" ;;
       *) die "docker run failed: $run_out" ;;
     esac
   fi
   say "done. The agent is running as container 'realuptime-agent'; it appears in the dashboard within a minute."
 }
 
+# SHA256 of a file: sha256sum where it exists (Linux), shasum -a 256 otherwise
+# (macOS ships only the latter).
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    need shasum
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 verify_release() {
   # $1 = tarball path, $2 = sums path, $3 = signature path (may be absent)
-  need sha256sum
   expected="$(grep " $(basename "$1")\$" "$2" | awk '{print $1}')"
   [ -n "$expected" ] || die "SHA256SUMS does not list $(basename "$1")"
-  actual="$(sha256sum "$1" | awk '{print $1}')"
+  actual="$(sha256_of "$1")"
   [ "$expected" = "$actual" ] || die "checksum mismatch for $(basename "$1"): refusing to install"
   if command -v cosign >/dev/null 2>&1 && [ -s "$3" ]; then
     cosign verify-blob --key "$COSIGN_KEY_URL" --signature "$3" "$2" >/dev/null 2>&1 \
@@ -336,8 +389,91 @@ UNIT
   say "done. systemctl status realuptime-agent; the agent appears in the dashboard within a minute."
 }
 
+# Single-quotes a value for a file the daemon's shell sources.
+sh_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+install_launchd() {
+  [ "$OS_NAME" = "Darwin" ] || die "--method launchd is for macOS; on this host use docker or systemd"
+  need curl; need tar; need launchctl
+  node_ok || die "Node.js 22 or newer is required on macOS (brew install node, or nodejs.org), and was not found"
+  say "installing the release binary as a launchd daemon"
+
+  tag="$(resolve_agent_tag)" || exit 1
+  work="$(mktemp -d)"
+  tarball="$work/realuptime-agent-${tag#agent-}.tgz"
+  say "downloading $tag"
+  curl -fsSL -o "$tarball" "$RELEASE_BASE/$tag/realuptime-agent-${tag#agent-}.tgz"
+  curl -fsSL -o "$work/SHA256SUMS" "$RELEASE_BASE/$tag/SHA256SUMS"
+  curl -fsSL -o "$work/SHA256SUMS.sig" "$RELEASE_BASE/$tag/SHA256SUMS.sig" || : > "$work/SHA256SUMS.sig"
+  verify_release "$tarball" "$work/SHA256SUMS" "$work/SHA256SUMS.sig"
+
+  as_root launchctl bootout "system/$MAC_LABEL" 2>/dev/null || true
+  as_root mkdir -p "$MAC_INSTALL_DIR" "$MAC_ENV_DIR"
+  as_root tar -xzf "$tarball" -C "$MAC_INSTALL_DIR" --strip-components=1
+  as_root chown -R root:wheel "$MAC_INSTALL_DIR"
+
+  # The token lives in a file only the service user can read, sourced by the
+  # daemon's shell. It is never in the plist (world-readable) or on a command line.
+  tmp="$(mktemp)"
+  {
+    printf 'REALUPTIME_TOKEN=%s\n' "$(sh_quote "$TOKEN")"
+    [ -n "$URL" ] && printf 'REALUPTIME_URL=%s\n' "$(sh_quote "$URL")"
+    [ -n "$CLUSTER" ] && printf 'REALUPTIME_CLUSTER=%s\n' "$(sh_quote "$CLUSTER")"
+    [ -n "$NODE_LABEL" ] && printf 'REALUPTIME_NODE=%s\n' "$(sh_quote "$NODE_LABEL")"
+    true
+  } > "$tmp"
+  as_root install -m 0600 "$tmp" "$MAC_ENV_FILE"
+  as_root chown nobody:wheel "$MAC_ENV_FILE"
+  rm -f "$tmp"
+  as_root touch "$MAC_LOG"
+  as_root chown nobody:wheel "$MAC_LOG"
+
+  node_bin="$(command -v node)"
+  tmpplist="$(mktemp)"
+  cat > "$tmpplist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$MAC_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>set -a; . $MAC_ENV_FILE; set +a; exec $node_bin $MAC_INSTALL_DIR/dist/agent.js</string>
+  </array>
+  <key>UserName</key>
+  <string>nobody</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>$MAC_LOG</string>
+  <key>StandardErrorPath</key>
+  <string>$MAC_LOG</string>
+</dict>
+</plist>
+PLIST
+  as_root install -m 0644 "$tmpplist" "$MAC_PLIST"
+  as_root chown root:wheel "$MAC_PLIST"
+  rm -f "$tmpplist"
+  rm -rf "$work"
+
+  as_root launchctl bootstrap system "$MAC_PLIST"
+  as_root launchctl enable "system/$MAC_LABEL"
+  as_root launchctl kickstart -k "system/$MAC_LABEL"
+  say "done. The agent runs as the launchd daemon $MAC_LABEL (log: $MAC_LOG); it appears in the dashboard within a minute."
+}
+
 case "$METHOD" in
   docker) install_docker ;;
   systemd) install_systemd ;;
-  *) die "unknown --method $METHOD (docker|systemd)" ;;
+  launchd) install_launchd ;;
+  *) die "unknown --method $METHOD (docker|systemd|launchd)" ;;
 esac
