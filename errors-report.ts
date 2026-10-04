@@ -23,7 +23,8 @@ import { hostname } from "node:os";
  * (packages/errors-js/types.ts's `WireEvent`/`WireBatch`, pinned by
  * wire-contract.test.ts on every other SDK) using nothing but the
  * platform's built-in `fetch`. It captures far less than the real SDK
- * (no breadcrumbs, no scrubbing pipeline, no stack-frame parsing) because
+ * (no breadcrumbs, no stack-frame parsing, and a small strict redaction
+ * below in place of the SDK's scrub and the shared outbound filter) because
  * covering less surface with zero new dependencies is the right trade for
  * this one program; the four Fly-hosted services get the full SDK.
  *
@@ -34,8 +35,43 @@ import { hostname } from "node:os";
  */
 
 const SDK_LABEL = "realuptime-agent-native/1";
-const MAX_MESSAGE_LENGTH = 4000;
+const MAX_MESSAGE_LENGTH = 500;
 const SEND_TIMEOUT_MS = 10_000;
+
+/**
+ * What leaves for the internal Errors host, which receives no customer
+ * personal data (packages/db/internal-telemetry.ts, the filter every other
+ * internal reporter installs). This program cannot import that module (see
+ * above), so it carries a smaller, STRICTER copy: the message's first line
+ * only; every single-quoted literal replaced; everything from the first
+ * double quote, backtick or `{` to the end dropped (quoted input and JSON
+ * echoes have quotes of their own, so no pairing is trusted); and every URL,
+ * email, IP address, UUID, phone number, long number and dotted hostname
+ * replaced, ours included. It keeps less than the shared filter, never
+ * more; errors-report.test.ts runs the shared filter's personal-data
+ * vectors against it.
+ */
+const REDACTIONS: [RegExp, string][] = [
+  [/'[^'\n]*'/g, "<redacted>"],
+  [/["`{].*$/, "<redacted>"],
+  [/\b[a-z][a-z0-9+.-]*:\/\/\S+/gi, "<url>"],
+  [/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "<email>"],
+  [/(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])/g, "<ip>"],
+  [/[0-9a-fA-F]{0,4}::[0-9a-fA-F]*[0-9][0-9a-fA-F:.]*|\b(?:[0-9a-fA-F]{1,4}:){4,7}[0-9a-fA-F]{1,4}\b/g, "<ip>"],
+  [/\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g, "<id>"],
+  [/\+\d[\d ().-]{6,18}\d/g, "<phone>"],
+  [/(?<![\w.])\d{9,}(?![\w.])/g, "<n>"],
+  [/(?<![\w/\\@<-])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{1,62}(?![\w-])/gi, "<host>"],
+];
+
+export function redactAgentMessage(message: string): string {
+  const firstLine = String(message).split(/\r?\n/, 1)[0] ?? "";
+  let out = firstLine.length > MAX_MESSAGE_LENGTH ? firstLine.slice(0, MAX_MESSAGE_LENGTH) : firstLine;
+  for (const [pattern, replacement] of REDACTIONS) out = out.replace(pattern, replacement);
+  return out;
+}
+
+const EXCEPTION_TYPE_RE = /^[A-Za-z_$][A-Za-z0-9_$]{0,99}$/;
 
 export interface ErrorsReportConfig {
   dsn: string;
@@ -68,8 +104,8 @@ export function loadErrorsReportConfig(env: NodeJS.ProcessEnv): ErrorsReportConf
 function buildEvent(config: ErrorsReportConfig, message: string, exceptionType: string | null) {
   return {
     occurredAt: new Date().toISOString(),
-    message: message.length > MAX_MESSAGE_LENGTH ? message.slice(0, MAX_MESSAGE_LENGTH) : message,
-    exceptionType,
+    message: redactAgentMessage(message),
+    exceptionType: exceptionType === null || EXCEPTION_TYPE_RE.test(exceptionType) ? exceptionType : "Error",
     release: config.release ?? null,
     environment: config.environment,
     frames: null,

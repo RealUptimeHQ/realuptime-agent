@@ -171,13 +171,15 @@ would resolve without installing anything with `install.sh --print-version`
 
 ## Configuration
 
-Environment variables only. There are no flags and no config file.
+Environment variables only. There are no flags and no config file. The one
+file you may point it at besides the token file is the secrets file, which
+holds values for authenticated checks and cannot change what the agent does.
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `REALUPTIME_TOKEN` | Yes (or the file) | none | The `rua_...` agent token from the dashboard. |
 | `REALUPTIME_TOKEN_FILE` | No | none | A path to read the token from once, at start. For Kubernetes (one Secret key per node) and Docker/Podman secrets. The only file path the agent accepts from its environment. |
-| `REALUPTIME_URL` | No | `https://realuptime.io` | Override only for a self-hosted or staging deployment. |
+| `REALUPTIME_URL` | No | `https://ingest.realuptime.io` | Override only for a self-hosted or staging deployment. `https://realuptime.io` serves the same agent routes. |
 | `REALUPTIME_CLUSTER` | No | none | A label: which cluster this host belongs to. The dashboard groups hosts by it. |
 | `REALUPTIME_NODE` | No | the hostname | A label: this host's node name. |
 | `REALUPTIME_POSTGRES_DSN` | No | none | A `postgresql://user:password@host:port/db` connection string. Off by default: set it to have this agent also report PostgreSQL health (connections, database sizes, cache hit ratio, longest running query, replication lag). See [PostgreSQL metrics](#postgresql-metrics) below. |
@@ -195,6 +197,9 @@ Environment variables only. There are no flags and no config file.
 | `REALUPTIME_MAX_CONCURRENT_PROBES` | No | `8` | Probes in flight at once. |
 | `REALUPTIME_MAX_PROBES_PER_MINUTE` | No | `600` | Probes started per rolling minute. Past it, the excess is skipped and each skipped check reports the reason rather than going quiet. |
 | `REALUPTIME_MAX_ASSIGNED_CHECKS` | No | `250` | Checks this agent accepts from one check list. |
+| `REALUPTIME_SECRET_<NAME>` | No | none | The value of a secret an authenticated check references as `${SECRET:<NAME>}`. `NAME` is capital letters, digits and underscores. Read when the check runs, never logged, never sent to RealUptime. See [Authenticated checks](#authenticated-checks) below. |
+| `REALUPTIME_SECRETS_FILE` | No | none | A path to a `NAME=value` file, consulted for a name no `REALUPTIME_SECRET_<NAME>` variable sets. Re-read when it changes, so a rotated credential needs no restart. |
+| `REALUPTIME_AUTH_HEADERS` | No | none | Comma-separated header names this agent may send a secret in, beyond `Authorization`, `Proxy-Authorization`, `Cookie` and `X-Api-Key` (`X-Internal-Auth, X-Tenant-Key`). Framing and identity headers (`Host`, `Content-Length`, `User-Agent` and the like) are never allowed. |
 
 A missing token is the only condition that stops the agent. Everything else,
 including a rejected token, is retried indefinitely. A typo in any of the
@@ -253,6 +258,55 @@ name that moved between the check and the dial. An http check is re-checked per
 hop but cannot be pinned the same way (Node's built-in `fetch` exposes no hook
 for it without adding a dependency this program deliberately does not have), so
 its window is the milliseconds between the agent's lookup and `fetch`'s own.
+
+## Authenticated checks
+
+An internal admin panel or a private API usually needs a credential. The
+credential stays on this machine: the check RealUptime sends carries a NAME,
+and this agent fills in the value when it runs the check.
+
+In the dashboard, the monitor's Authentication section takes a header and a
+value with a reference in it:
+
+```
+Authorization: Bearer ${SECRET:BILLING_API_TOKEN}
+```
+
+On this machine, set the value:
+
+```
+docker run ... -e REALUPTIME_SECRET_BILLING_API_TOKEN=<the token> ...
+```
+
+or put `BILLING_API_TOKEN=<the token>` in a file only this service can read and
+point `REALUPTIME_SECRETS_FILE` at it. A variable wins over the file when both
+set a name.
+
+RealUptime stores and sends the text `Bearer ${SECRET:BILLING_API_TOKEN}` and
+nothing else. A stolen check list, a leaked RealUptime database and a
+compromised RealUptime server all reveal that a check sends a bearer token
+named `BILLING_API_TOKEN`, never the token. The rules, all enforced here:
+
+- **A reference is filled in only in a header value or in the check's user
+  name and password** (sent as HTTP Basic), never in the host, path, port or
+  query. A check whose address contains a reference is refused before any
+  packet leaves, because a secret that can be written into a hostname can be
+  sent anywhere.
+- **Only header names this machine allows.** `Authorization`,
+  `Proxy-Authorization`, `Cookie` and `X-Api-Key`, plus whatever you list in
+  `REALUPTIME_AUTH_HEADERS`. RealUptime cannot add one.
+- **A missing secret fails the check.** It reports `This location has no
+  secret named BILLING_API_TOKEN`. The request is never sent with the
+  placeholder text in it, and never sent without the header.
+- **The value is sent only to the check's own address.** On a redirect to
+  another origin, the credential is left behind.
+- **The value never appears anywhere else.** Every resolved value is scrubbed
+  from this agent's log lines and from every error it reports to RealUptime,
+  including a truncated fragment of one.
+
+Authenticated checks need agent 0.4.0 or later. An older agent is never handed
+the reference: RealUptime sends it the check with no address, and it reports
+`Check is missing configuration: no url` until it is updated.
 
 ## How much this agent will do
 
@@ -523,6 +577,30 @@ minutes (clears under 88% for 5), and CPU 90% for 5 minutes, off until you
 turn it on. A rule fires only once the reading has held past its line for
 the whole window, so a build or a backup does not page you.
 
+## Planned maintenance
+
+Before you restart, patch or reboot the machine, flag the downtime as
+expected. The agent does it with its own token, so no account API key has
+to live on the box:
+
+```sh
+# Docker
+docker exec realuptime-agent node dist/agent.js maintenance --minutes 30 --reason "kernel update"
+docker exec realuptime-agent node dist/agent.js maintenance --end
+# systemd
+sudo sh -c 'set -a; . /etc/realuptime-agent/env; exec node /opt/realuptime-agent/dist/agent.js maintenance --status'
+```
+
+While the window is active this server raises no offline or health alert,
+and every check that runs from this agent, or targets this machine's host
+name or a `--host NAME` you add, opens no incident, sends nothing and does
+not count against uptime. When it ends (`--end`, or `--minutes` running
+out; 15 by default, a day at most) anything still down is reported from
+that moment, never backdated. The subcommand makes one call to
+`/api/v1/agents/self/maintenance` and exits: 0 on success, 1 on a failed
+call, 2 on a usage error. The same window can be opened from the server's
+page in the dashboard or with `POST /api/v1/agents/{id}/maintenance`.
+
 ## What the agent cannot do
 
 These are limits built into the program, not settings you can turn on:
@@ -554,9 +632,11 @@ These are limits built into the program, not settings you can turn on:
   argument, and neither one is ever a name the SERVER supplied -- both come
   from this machine's own local configuration or its own prior cgroup/Docker
   discovery.
-- **It reads no configuration file, no credentials, and none of your data.**
+- **It reads no configuration file and none of your data.**
   Its complete configuration input is the environment variables above (plus
-  the one token file, when you point it at one). What it DOES read is a
+  the token file and the secrets file, when you point it at them). The only
+  credentials it reads are the secrets you give it for [authenticated
+  checks](#authenticated-checks), and only the ones a check names. What it DOES read is a
   small, fixed set of read-only files the Linux kernel exposes about the
   machine itself: `/proc/stat`, `/proc/meminfo`, `/proc/loadavg`,
   `/proc/mounts`, `/proc/net/dev`, `/proc/[pid]/stat`, `/etc/os-release`,
@@ -589,7 +669,9 @@ These are limits built into the program, not settings you can turn on:
   your machine.
 - **It speaks a closed, finite vocabulary and refuses everything outside it.**
   A check is one of four verbs (http, tcp, dns, ping) and nothing else. An http
-  check is a GET with no request body and no server-chosen headers. A tcp check
+  check is a GET with no request body and no server-chosen headers: the only
+  headers it adds are the authentication headers this machine allows, filled
+  from secrets held on this machine. A tcp check
   writes zero bytes and its port must be a real port and not one of the RFC
   862-865 amplification ports. A dns check may ask for one of six record types
   (A, AAAA, CNAME, MX, TXT, NS) and nothing else, which is why it can never be

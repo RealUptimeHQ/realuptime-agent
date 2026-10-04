@@ -6,7 +6,10 @@ import { readFileSync } from "node:fs";
  * There is no config file, no config directory, no `--flag`, and no
  * server-pushed setting that changes how this process behaves locally (the
  * one exception, the service watch list, can only name units and is
- * documented in collect-services.ts). That is a security property, not
+ * documented in collect-services.ts). The secrets file (REALUPTIME_SECRETS_FILE
+ * below) is not a config file in that sense: it holds values an
+ * authenticated check may reference and nothing else, and no line in it can
+ * change what the process does. That is a security property, not
  * minimalism for its own sake. A customer's security reviewer can read this
  * one file and know the complete set of inputs the program accepts, and an
  * attacker who reaches the machine cannot repoint the agent by dropping a
@@ -24,8 +27,9 @@ import { readFileSync } from "node:fs";
  *                           with the node name; and for Docker/Podman
  *                           secrets. The file is read exactly once and its
  *                           path is never derived from anything the server
- *                           sends. This is the ONLY file path this program
- *                           accepts from its environment.
+ *                           sends. One of the only two file paths this
+ *                           program accepts from its environment; the
+ *                           other is REALUPTIME_SECRETS_FILE below.
  *   REALUPTIME_URL          origin override for self-hosted / staging
  *   REALUPTIME_CLUSTER      optional label: which cluster this host is in
  *   REALUPTIME_NODE         optional label: this host's node name (defaults
@@ -98,6 +102,38 @@ import { readFileSync } from "node:fs";
  *                           set on a RealUptime-owned host running this
  *                           same binary for our own monitoring, never on a
  *                           customer's.
+ *   REALUPTIME_SECRET_<NAME>
+ *                           optional (private locations phase 3): the value
+ *                           of the secret an authenticated check references
+ *                           as `${SECRET:<NAME>}`. Read at dial time by
+ *                           secrets.ts, never at start, never logged, never
+ *                           sent anywhere but the one request header or URL
+ *                           credential the check names. Not part of
+ *                           `AgentConfig`: the set of names is open-ended,
+ *                           and holding every value in a config object for
+ *                           the life of the process would only widen where
+ *                           a value lives.
+ *   REALUPTIME_SECRETS_FILE optional (phase 3): a path to a `NAME=value`
+ *                           file the customer controls, consulted for a
+ *                           name REALUPTIME_SECRET_<NAME> does not set. Read
+ *                           at dial time and re-read when it changes, so a
+ *                           rotated credential needs no restart. Its path is
+ *                           never derived from anything the server sends.
+ *   REALUPTIME_AUTH_HEADERS optional (phase 3): comma-separated header names
+ *                           this location may send secrets in, beyond the
+ *                           four every agent allows (Authorization,
+ *                           Proxy-Authorization, Cookie, X-Api-Key). Held
+ *                           here, on this machine, because a header set the
+ *                           server could widen is how a probe becomes a
+ *                           generic HTTP client. Names that are not valid
+ *                           header names, or that name a header the agent
+ *                           must control itself (Host, Content-Length, and
+ *                           the rest of `FORBIDDEN_AUTH_HEADER_NAMES`), are
+ *                           dropped by secrets.ts, the same split of
+ *                           responsibility REALUPTIME_LOG_UNITS has with
+ *                           collect-logs.ts, and the same "a typo never
+ *                           widens anything" rule every optional variable
+ *                           follows.
  */
 
 export interface AgentConfig {
@@ -134,12 +170,23 @@ export interface AgentConfig {
    *  (collect-logs.ts, pinned again in wire-contract.test.ts since this
    *  file imports nothing from that one). */
   logLines: number;
+  /** Phase 3: REALUPTIME_AUTH_HEADERS, split and trimmed but NOT
+   *  shape-validated here; secrets.ts's `allowedAuthHeaderNames` does that. */
+  authHeaderNames: string[];
+  /** Phase 3: REALUPTIME_SECRETS_FILE, or null. The path only; the file is
+   *  read by secrets.ts at dial time. */
+  secretsFile: string | null;
 }
 
 export const GPU_VENDORS = ["nvidia", "amd", "intel"] as const;
 export type GpuVendor = (typeof GPU_VENDORS)[number];
 
-export const DEFAULT_BASE_URL = "https://realuptime.io";
+/** apps/ingest serves the whole agent protocol (poll, results, status,
+ *  metrics; REA-1009), so the default is its host, not the web app's. The web
+ *  app still answers the same routes, so an agent on an older default, or one
+ *  pointed at https://realuptime.io with REALUPTIME_URL, keeps working
+ *  (REA-1010). */
+export const DEFAULT_BASE_URL = "https://ingest.realuptime.io";
 export const MAX_LABEL_LENGTH = 128;
 /** Mirrors collect-logs.ts's LOG_SNAPSHOT_DEFAULT_LINES/MAX_LINES exactly
  *  (pinned together in wire-contract.test.ts); duplicated as literals here
@@ -228,6 +275,11 @@ export function loadConfig(
     logUnits,
     logDockerEnabled,
     logLines,
+    authHeaderNames: (env.REALUPTIME_AUTH_HEADERS ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+    secretsFile: (env.REALUPTIME_SECRETS_FILE ?? "").trim() || null,
   };
 }
 

@@ -1,3 +1,4 @@
+// biome-ignore-all lint/suspicious/noTemplateCurlyInString: ${SECRET:NAME} is the literal wire format of a secret reference, never a template placeholder
 import { describe, expect, it } from "vitest";
 import {
   ApiClient,
@@ -26,6 +27,8 @@ const config: AgentConfig = {
   logUnits: [],
   logDockerEnabled: false,
   logLines: 50,
+  authHeaderNames: [],
+  secretsFile: null,
 };
 
 function stub(status: number, body: unknown = {}): typeof fetch {
@@ -41,6 +44,30 @@ function result(n: number): CheckResult {
 }
 
 describe("ApiClient", () => {
+  it("carries the location's egress mode and counts on the poll when given them (REA-1013)", async () => {
+    const calls: [string, RequestInit][] = [];
+    const client = new ApiClient(config, async (url, init) => {
+      calls.push([String(url), init ?? {}]);
+      return new Response(JSON.stringify({ checks: [], services: [], requestLogSnapshot: false }), { status: 200 });
+    });
+    await client.poll({ mode: "report", refused: 0, wouldRefuse: 3, byRule: { public: 3 } });
+    expect(JSON.parse(String(calls[0]![1].body))).toEqual({
+      egress: { mode: "report", refused: 0, wouldRefuse: 3, byRule: { public: 3 } },
+    });
+  });
+
+  it("carries this build's version and capabilities on the poll when given them (phase 3)", async () => {
+    const calls: [string, RequestInit][] = [];
+    const client = new ApiClient(config, async (url, init) => {
+      calls.push([String(url), init ?? {}]);
+      return new Response(JSON.stringify({ checks: [] }), { status: 200 });
+    });
+    await client.poll(undefined, { version: "0.4.0", capabilities: ["secret_refs"], secretHeaderNames: ["X-Internal-Auth"] });
+    expect(JSON.parse(String(calls[0]![1].body))).toEqual({
+      agent: { version: "0.4.0", capabilities: ["secret_refs"], secretHeaderNames: ["X-Internal-Auth"] },
+    });
+  });
+
   it("posts to the contract's paths with a bearer token and an empty poll body", async () => {
     const calls: Array<[string, RequestInit]> = [];
     const fetchImpl = (async (url: string, init: RequestInit) => {
@@ -328,6 +355,75 @@ describe("parseChecks: the closed vocabulary", () => {
       checks: [{ id: "2", type: "dns", dnsHostname: "h.internal", dnsRecordType: "ANY", intervalSeconds: 60 }],
     });
     expect(c?.dnsRecordType).toBeNull();
+  });
+});
+
+describe("parseChecks: the auth block (private locations phase 3)", () => {
+  const http = (auth: unknown) => ({ id: "a1", type: "http", url: "http://10.0.0.5/admin", intervalSeconds: 60, auth });
+
+  it("reads a well-formed block verbatim, references and all", () => {
+    const [check] = parseChecks({
+      checks: [
+        http({
+          headers: [{ name: "Authorization", value: "Bearer ${SECRET:BILLING_API_TOKEN}" }],
+          userinfo: null,
+        }),
+      ],
+    });
+    expect(check?.auth).toEqual({
+      headers: [{ name: "Authorization", value: "Bearer ${SECRET:BILLING_API_TOKEN}" }],
+      userinfo: null,
+    });
+  });
+
+  it("treats absent, null and empty blocks as an unauthenticated check", () => {
+    for (const auth of [undefined, null, { headers: [], userinfo: null }, { headers: [] }]) {
+      const [check] = parseChecks({ checks: [http(auth)] });
+      expect(check?.auth, JSON.stringify(auth)).toBeNull();
+    }
+  });
+
+  it("refuses the whole check for any shape it does not understand, and keeps the others", () => {
+    const refused = [
+      "Bearer x",
+      [],
+      { headers: "Authorization: x" },
+      { headers: [{ name: "Authorization", value: "a", extra: 1 }] },
+      { headers: [{ name: "Authorization" }] },
+      { headers: [{ name: "Bad Name", value: "${SECRET:A}" }] },
+      { headers: [{ name: "Authorization", value: "Bearer ${SECRET:A}\r\nX-Evil: 1" }] },
+      { headers: [{ name: "Authorization", value: "" }] },
+      { headers: [{ name: "Authorization", value: "x".repeat(parseRules.maxAuthTemplateChars + 1) }] },
+      { headers: Array.from({ length: parseRules.maxAuthHeaders + 1 }, () => ({ name: "Cookie", value: "a=${SECRET:A}" })) },
+      { headers: [], userinfo: 42 },
+      { headers: [], userinfo: "admin:${SECRET:PW}\n" },
+      // A key a future server might add. Half-reading a block is the
+      // pass-through the closed vocabulary forbids.
+      { headers: [], userinfo: null, query: "token=${SECRET:A}" },
+    ];
+    for (const auth of refused) {
+      const checks = parseChecks({ checks: [http(auth), { id: "ok", type: "tcp", tcpHost: "db", tcpPort: 5432, intervalSeconds: 60 }] });
+      expect(checks.map((c) => c.id), JSON.stringify(auth)).toEqual(["ok"]);
+    }
+  });
+
+  it("refuses an auth block on a check type that has no request to put it in", () => {
+    const checks = parseChecks({
+      checks: [{ id: "t", type: "tcp", tcpHost: "db", tcpPort: 5432, intervalSeconds: 60, auth: { headers: [], userinfo: "a:${SECRET:B}" } }],
+    });
+    expect(checks).toEqual([]);
+  });
+
+  it("mutation: with the auth keys widened, the unknown key is accepted", () => {
+    const original = parseRules.authKeys;
+    try {
+      parseRules.authKeys = [...original, "query"];
+      const [check] = parseChecks({ checks: [http({ headers: [], userinfo: "a:${SECRET:B}", query: "x" })] });
+      expect(check?.auth?.userinfo).toBe("a:${SECRET:B}");
+    } finally {
+      parseRules.authKeys = original;
+    }
+    expect(parseChecks({ checks: [http({ headers: [], userinfo: "a:${SECRET:B}", query: "x" })] })).toEqual([]);
   });
 });
 

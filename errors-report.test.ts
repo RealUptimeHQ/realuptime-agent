@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { installErrorsReporting, loadErrorsReportConfig } from "./errors-report.ts";
+import { installErrorsReporting, loadErrorsReportConfig, redactAgentMessage } from "./errors-report.ts";
 
 /**
  * REA-575: this agent's own unhandled exceptions/rejections report to
@@ -166,5 +166,53 @@ describe("installErrorsReporting", () => {
     const handler = installed.find((i) => i.event === "unhandledRejection")?.handler;
     expect(() => handler?.("a rejected string, not an Error")).not.toThrow();
     await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  it("sends the redacted message, never the raw one", async () => {
+    trackListeners();
+    const { fetchImpl, calls } = fetchStub();
+    installErrorsReporting(
+      { REALUPTIME_ERRORS_INTERNAL: "1", REALUPTIME_ERRORS_DSN: "https://x/api/errors/v1/ingest/rue_a", FLY_APP_NAME: "test-host" },
+      () => {},
+      fetchImpl,
+    );
+    installed.find((i) => i.event === "uncaughtException")?.handler(new Error("POST https://shop.acme-widgets.com/?x=1 by jane.doe@example.com"));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const body = JSON.parse(String(calls[0][1].body));
+    expect(body.events[0].message).toBe("POST <url> by <email>");
+  });
+});
+
+describe("redactAgentMessage", () => {
+  // The personal-data shapes packages/db/internal-telemetry.test.ts proves
+  // the shared filter removes; this stricter copy must remove them too.
+  const PERSONAL = [
+    "jane.doe@example.com",
+    "Jane Doe",
+    "shop.acme-widgets.com",
+    "tok_9f8e7d6c",
+    "203.0.113.42",
+    "2001:db8:85a3::8a2e:370:7334",
+    "4f9c2b1e-8d7a-4c3b-9e2f-1a2b3c4d5e6f",
+    "+14155550123",
+    "Chocolate cake order",
+  ];
+  const messages = [
+    "request to https://shop.acme-widgets.com/health?token=tok_9f8e7d6c failed, reason: getaddrinfo ENOTFOUND shop.acme-widgets.com",
+    `Unexpected token 'u', "{"user":{"email":"jane.doe@example.com","name":"Jane Doe"}}" is not valid JSON`,
+    'signup failed for "Jane Doe" <jane.doe@example.com> (+14155550123) on 4f9c2b1e-8d7a-4c3b-9e2f-1a2b3c4d5e6f from 203.0.113.42 / 2001:db8:85a3::8a2e:370:7334',
+    'truncated echo "Chocolate cake order',
+    "first line\nJane Doe on the second line",
+  ];
+
+  it("leaves nothing personal in any representative message", () => {
+    for (const message of messages) {
+      const out = redactAgentMessage(message);
+      for (const value of PERSONAL) expect(out, message).not.toContain(value);
+    }
+  });
+
+  it("keeps a plain docker socket error readable", () => {
+    expect(redactAgentMessage("connect ENOENT /var/run/docker.sock")).toBe("connect ENOENT /var/run/docker.sock");
   });
 });

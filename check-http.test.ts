@@ -118,7 +118,7 @@ describe("runHttpCheck", () => {
     });
     const out = await runHttpCheck(url, 300);
     expect(out.ok).toBe(false);
-    expect(out.error).toBe("The request timed out");
+    expect(out.error).toBe("No response within 0.3 seconds");
   });
 
   it("reports a refused connection as down", async () => {

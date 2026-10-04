@@ -3,7 +3,11 @@ import { runHttpCheck } from "./check-http.ts";
 import { runTcpCheck } from "./check-tcp.ts";
 import { runPingCheck } from "./check-ping.ts";
 import type { EgressGuard } from "./egress-guard.ts";
+import { redactSecrets } from "./log.ts";
+import { prepareCheckAuth, type SecretSource } from "./secrets.ts";
 import type { AgentCheck, CheckResult } from "./types.ts";
+
+const NO_SECRETS: SecretSource = { lookup: () => undefined };
 
 /**
  * Turn one assigned check into one result.
@@ -39,13 +43,45 @@ import type { AgentCheck, CheckResult } from "./types.ts";
  * every other check on the machine down with it, over a server-side field the
  * agent cannot fix.
  */
-export async function executeCheck(check: AgentCheck, egress?: EgressGuard): Promise<CheckResult> {
+export async function executeCheck(
+  check: AgentCheck,
+  egress?: EgressGuard,
+  /** Where `${SECRET:NAME}` references resolve from, and which header names
+   * this location sends them in (private locations phase 3). Omitted means no
+   * secrets at all: an authenticated check then fails naming the secret it
+   * could not find, which is the safe reading of "nothing configured". */
+  secrets?: CheckSecrets,
+): Promise<CheckResult> {
+  const result = await runCheck(check, egress, secrets);
+  // Every error string is scrubbed of every secret value this process has
+  // resolved, on every check type, before it is queued for the server
+  // (section 3.6). The http branch also scrubs its own values explicitly, so
+  // a value is covered even in the instant before the shared registry sees it.
+  return result.error === undefined ? result : { ...result, error: redactSecrets(result.error) };
+}
+
+/** What an http check needs to resolve its auth block. */
+export interface CheckSecrets {
+  source: SecretSource;
+  allowedHeaderNames: readonly string[];
+}
+
+async function runCheck(check: AgentCheck, egress?: EgressGuard, secrets?: CheckSecrets): Promise<CheckResult> {
   const checkedAt = new Date().toISOString();
 
   try {
     switch (check.type) {
       case "http": {
         if (!check.url) return malformed(check.id, checkedAt, "no url");
+        const prepared = prepareCheckAuth(
+          check.url,
+          check.auth,
+          secrets?.source ?? NO_SECRETS,
+          secrets?.allowedHeaderNames,
+        );
+        // Refused before any packet leaves: no request is ever sent with a
+        // placeholder in it, and none is sent with the credential left off.
+        if (!prepared.ok) return { checkId: check.id, ok: false, error: prepared.error, checkedAt };
         const out = await runHttpCheck(check.url, undefined, undefined, {
           assertionBodyOp: check.assertionBodyOp,
           assertionBodyValue: check.assertionBodyValue,
@@ -58,13 +94,13 @@ export async function executeCheck(check: AgentCheck, egress?: EgressGuard): Pro
           assertionJsonPath: check.assertionJsonPath,
           assertionJsonOp: check.assertionJsonOp,
           assertionJsonValue: check.assertionJsonValue,
-        }, egress);
+        }, egress, prepared.headers);
         return {
           checkId: check.id,
           ok: out.ok,
           statusCode: out.statusCode,
           latencyMs: out.latencyMs,
-          error: out.error,
+          error: out.error === undefined ? undefined : redactSecrets(out.error, prepared.secretValues),
           checkedAt,
         };
       }

@@ -84,6 +84,14 @@ const defaultLookup: LookupFn = (hostname, options) =>
  * the agent's health surface is its log stream. `runtime.ts` drains this once
  * a minute onto the poll line.
  */
+/** One poll's worth of egress verdicts: what `EgressReport.drain` returns and
+ * what the poll carries to the server (REA-1013). */
+export interface EgressCounts {
+  refused: number;
+  wouldRefuse: number;
+  byRule: Record<string, number>;
+}
+
 export class EgressReport {
   private counts = new Map<EgressRule, number>();
   private wouldRefuse = 0;
@@ -99,7 +107,7 @@ export class EgressReport {
 
   /** Read and clear. Called once per poll so the numbers on a line describe
    * the minute that line covers, not the life of the process. */
-  drain(): { refused: number; wouldRefuse: number; byRule: Record<string, number> } {
+  drain(): EgressCounts {
     const byRule: Record<string, number> = {};
     for (const [rule, count] of this.counts) byRule[rule] = count;
     const drained = { refused: this.refused, wouldRefuse: this.wouldRefuse, byRule };
@@ -107,6 +115,17 @@ export class EgressReport {
     this.refused = 0;
     this.wouldRefuse = 0;
     return drained;
+  }
+
+  /** Put drained counts back, for a poll that failed to carry them: the next
+   * poll reports them instead of the numbers quietly going missing. */
+  restore(counts: EgressCounts): void {
+    for (const [rule, count] of Object.entries(counts.byRule)) {
+      const key = rule as EgressRule;
+      this.counts.set(key, (this.counts.get(key) ?? 0) + count);
+    }
+    this.refused += counts.refused;
+    this.wouldRefuse += counts.wouldRefuse;
   }
 }
 

@@ -205,16 +205,22 @@ export interface EgressPolicy {
 
 /** Which rule refused. Reported in the log line, never in the customer-facing
  * error text, which stays one sentence. */
-export type EgressRule =
-  | "metadata"
-  | "link_local"
-  | "multicast"
-  | "unspecified"
-  | "unknown_address"
-  | "loopback"
-  | "public"
-  | "allowlist_host"
-  | "allowlist_port";
+/** Every rule a verdict can name. A runtime list, not only a type, because
+ * the server stores counts per rule and wire-contract.test.ts pins its list
+ * to this one (REA-1013). */
+export const EGRESS_RULES = [
+  "metadata",
+  "link_local",
+  "multicast",
+  "unspecified",
+  "unknown_address",
+  "loopback",
+  "public",
+  "allowlist_host",
+  "allowlist_port",
+] as const;
+
+export type EgressRule = (typeof EGRESS_RULES)[number];
 
 export type EgressVerdict =
   | { allow: true }

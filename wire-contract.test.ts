@@ -81,9 +81,12 @@ describe("wire contract", () => {
       assertionJsonPath: "data.items[0].status",
       assertionJsonOp: "equals",
       assertionJsonValue: "ok",
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: ${SECRET:NAME} is the literal wire format of a secret reference, not a template placeholder
+      auth: { headers: [{ name: "Authorization", value: "Bearer ${SECRET:TOKEN}" }], userinfo: null },
     };
     expect(Object.keys(check).sort()).toEqual(
       [
+        "auth",
         "assertionBodyCaseSensitive",
         "assertionBodyOp",
         "assertionBodyValue",
@@ -610,6 +613,7 @@ describe("dependency hygiene", () => {
       "platform.ts",
       "runtime.ts",
       "scheduler.ts",
+      "secrets.ts",
       "types.ts",
       "vantage.ts",
       "version.ts",
@@ -664,3 +668,70 @@ describe("json-path duplicate", () => {
     expect(bodyOf(agent)).toBe(bodyOf(fleet));
   });
 });
+
+// REA-1013: the rules an agent reports egress counts under are the rules the
+// server stores. A rule added on one side only would either be refused whole
+// by the server's parser or never be counted.
+describe("egress rule names", () => {
+  it("match the server's list exactly", async () => {
+    const { EGRESS_RULES } = await import("./egress-policy.ts");
+    const here = dirname(fileURLToPath(import.meta.url));
+    const server = readFileSync(join(here, "../../packages/db/monitor-agent-egress.ts"), "utf8");
+    const start = server.indexOf("export const EGRESS_RULES = [");
+    const block = server.slice(start, server.indexOf("] as const;", start));
+    const serverRules = [...block.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
+    expect(serverRules).toEqual([...EGRESS_RULES]);
+  });
+});
+
+// Private locations phase 3: the secret-reference rules the dashboard
+// validates against are the rules this agent enforces. A header the server
+// accepts and the agent refuses is a monitor that fails on its first probe;
+// one the agent accepts and the server refuses is dead code. Both halves hold
+// literals rather than imports (this package imports nothing from the
+// server), so the text is pinned here. Skipped in the public mirror, where
+// packages/db does not exist.
+describe("secret reference rules", () => {
+  const serverPath = join(HERE, "../../packages/db/check-auth-rules.ts");
+  const serverList = (source: string, name: string): string[] => {
+    const start = source.indexOf(`export const ${name} = [`);
+    expect(start, name).toBeGreaterThan(-1);
+    const block = source.slice(start, source.indexOf("] as const;", start));
+    return [...block.matchAll(/"([^"]+)"/g)].map((m) => m[1]!);
+  };
+
+  it("match the server's header lists, name pattern and capability", async (ctx) => {
+    if (!existsSync(serverPath)) ctx.skip();
+    const server = readFileSync(serverPath, "utf8");
+    const { BASE_AUTH_HEADER_NAMES, FORBIDDEN_AUTH_HEADER_NAMES, SECRET_NAME_PATTERN } = await import("./secrets.ts");
+    const { AGENT_CAPABILITIES } = await import("./version.ts");
+    expect(serverList(server, "BASE_AUTH_HEADER_NAMES")).toEqual([...BASE_AUTH_HEADER_NAMES]);
+    expect(serverList(server, "FORBIDDEN_AUTH_HEADER_NAMES")).toEqual([...FORBIDDEN_AUTH_HEADER_NAMES]);
+    expect(serverList(server, "AGENT_CAPABILITIES")).toEqual([...AGENT_CAPABILITIES]);
+    expect(server).toContain(`export const SECRET_NAME_PATTERN = /${SECRET_NAME_PATTERN.source}/;`);
+  });
+
+  it("is a version the server admits for authenticated checks", async (ctx) => {
+    // The server refuses secret references to any location reporting a
+    // version below its minimum (0.3.0 shipped with no secret support). This
+    // build declares the capability, so it has to clear that bar too.
+    if (!existsSync(serverPath)) ctx.skip();
+    const server = readFileSync(serverPath, "utf8");
+    const minimum = /export const SECRET_REFS_MIN_AGENT_VERSION = "(\d+)\.(\d+)\.(\d+)";/.exec(server);
+    expect(minimum).not.toBeNull();
+    const { AGENT_VERSION } = await import("./version.ts");
+    const have = AGENT_VERSION.split(".").map(Number);
+    const need = minimum!.slice(1).map(Number);
+    const cmp = have[0]! - need[0]! || have[1]! - need[1]! || have[2]! - need[2]!;
+    expect(cmp, `${AGENT_VERSION} vs ${minimum![0]}`).toBeGreaterThanOrEqual(0);
+  });
+
+  it("pins the auth block's bounds to the server's", async (ctx) => {
+    if (!existsSync(serverPath)) ctx.skip();
+    const server = readFileSync(serverPath, "utf8");
+    const { parseRules } = await import("./api.ts");
+    expect(server).toContain(`export const MAX_AUTH_HEADERS = ${parseRules.maxAuthHeaders};`);
+    expect(server).toContain(`export const MAX_AUTH_TEMPLATE_CHARS = ${parseRules.maxAuthTemplateChars};`);
+  });
+});
+

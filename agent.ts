@@ -5,14 +5,21 @@ import { createEgressGuard, EgressReport } from "./egress-guard.ts";
 import { loadEgressPolicy } from "./egress-policy.ts";
 import { installErrorsReporting } from "./errors-report.ts";
 import { log } from "./log.ts";
+import { runMaintenanceCommand } from "./maintenance-command.ts";
 import { AgentRuntime } from "./runtime.ts";
+import { allowedAuthHeaderNames, createSecretSource, declaredAuthHeaderNames } from "./secrets.ts";
+import { AGENT_CAPABILITIES, AGENT_VERSION } from "./version.ts";
 
 /**
  * RealUptime Monitor agent, entrypoint.
  *
- * Reads two environment variables, opens outbound HTTPS to one hostname, and
- * loops. It listens on no port, executes no shell, reads no file, and accepts
- * no instruction from the server other than the list of checks to run.
+ * Reads its environment, opens outbound HTTPS to one hostname, and loops. It
+ * listens on no port, executes no shell, reads no configuration file (only
+ * the token file and the secrets file, and only when the customer names
+ * them), and accepts no instruction from the server other than the list of
+ * checks to run. The
+ * one exception to "loops" is the `maintenance` subcommand
+ * (maintenance-command.ts), which makes a single call and exits.
  *
  * A bad configuration is the ONLY thing that exits nonzero, and only because a
  * missing token can never become a working one without a human. Everything
@@ -21,6 +28,20 @@ import { AgentRuntime } from "./runtime.ts";
  */
 
 async function main(): Promise<void> {
+  // `realuptime-agent maintenance ...` (REA-968): one API call with this
+  // agent's own token, then exit. Dispatched before anything else so a
+  // restart script running it never starts a second monitoring loop.
+  if (process.argv[2] === "maintenance") {
+    let config: ReturnType<typeof loadConfig>;
+    try {
+      config = loadConfig();
+    } catch (err) {
+      console.error(`realuptime-agent maintenance: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+    process.exit(await runMaintenanceCommand(process.argv.slice(3), config));
+  }
+
   // REA-575: wired before config even loads, so a crash during startup is
   // covered too. A no-op on every customer machine (see errors-report.ts);
   // only ever live on a RealUptime-owned host running this same binary
@@ -47,6 +68,15 @@ async function main(): Promise<void> {
   const bounds = loadBounds();
   const egressPolicy = loadEgressPolicy();
   const egressReport = new EgressReport();
+  // The same custody rule for authenticated checks (section 3.6): the header
+  // names a secret may travel in, and the values themselves, come from this
+  // machine and from nothing the server sends.
+  const authHeaderNames = allowedAuthHeaderNames(config.authHeaderNames);
+  const declaredHeaders = declaredAuthHeaderNames(config.authHeaderNames);
+  const secrets = {
+    source: createSecretSource({ secretsFile: config.secretsFile }),
+    allowedHeaderNames: authHeaderNames,
+  };
 
   log("info", "RealUptime Monitor agent", {
     baseUrl: config.baseUrl,
@@ -65,6 +95,10 @@ async function main(): Promise<void> {
     maxConcurrentProbes: bounds.maxConcurrentProbes,
     maxProbesPerMinute: bounds.maxProbesPerMinute,
     maxAssignedChecks: bounds.maxAssignedChecks,
+    // Names only. Which secrets exist, and their values, are never logged.
+    authHeaders: declaredHeaders.length ? declaredHeaders.join(",") : undefined,
+    authHeadersIgnored: config.authHeaderNames.length - declaredHeaders.length || undefined,
+    secretsFile: config.secretsFile ?? undefined,
   });
 
   const runtime = new AgentRuntime({
@@ -72,6 +106,13 @@ async function main(): Promise<void> {
     bounds,
     egress: createEgressGuard(egressPolicy, egressReport),
     egressReport,
+    egressMode: egressPolicy.mode,
+    secrets,
+    selfReport: {
+      version: AGENT_VERSION,
+      capabilities: [...AGENT_CAPABILITIES],
+      secretHeaderNames: declaredHeaders,
+    },
     metricsOptions: {
       cluster: config.cluster,
       node: config.node,

@@ -158,3 +158,15 @@ describe("createPinnedLookup", () => {
     expect((err as unknown as NodeJS.ErrnoException).code).toBe("ENOTFOUND");
   });
 });
+
+describe("EgressReport.restore (REA-1013)", () => {
+  it("puts drained counts back so the next poll reports them", () => {
+    const report = new EgressReport();
+    report.record({ allow: false, enforced: false, rule: "public", detail: "93.184.216.34" });
+    const first = report.drain();
+    report.record({ allow: false, enforced: true, rule: "metadata", detail: "169.254.169.254" });
+    report.restore(first);
+    expect(report.drain()).toEqual({ refused: 1, wouldRefuse: 1, byRule: { public: 1, metadata: 1 } });
+    expect(report.drain()).toEqual({ refused: 0, wouldRefuse: 0, byRule: {} });
+  });
+});

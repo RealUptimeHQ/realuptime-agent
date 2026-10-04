@@ -12,7 +12,7 @@ import { FLUSH_BATCH_SIZE, ResultBuffer } from "./buffer.ts";
 import { MetricsCollector, type MetricsCollectorOptions } from "./collect-metrics.ts";
 import type { EgressGuard } from "./egress-guard.ts";
 import { EgressReport } from "./egress-guard.ts";
-import { executeCheck } from "./execute.ts";
+import { executeCheck, type CheckSecrets } from "./execute.ts";
 import { log } from "./log.ts";
 import { METRICS_FLUSH_BATCH_SIZE, MetricsBuffer } from "./metrics-buffer.ts";
 import { Scheduler, TICK_MS } from "./scheduler.ts";
@@ -20,6 +20,7 @@ import { AGENT_VERSION } from "./version.ts";
 import {
   WIRE_PROTOCOL_VERSION,
   type AgentCheck,
+  type AgentSelfReport,
   type CheckResult,
   type HostInfo,
   type MetricSample,
@@ -84,7 +85,7 @@ export interface MetricsSource {
 export interface RuntimeDeps {
   api: AgentApi;
   now?: () => number;
-  execute?: (check: AgentCheck, egress?: EgressGuard) => Promise<CheckResult>;
+  execute?: (check: AgentCheck, egress?: EgressGuard, secrets?: CheckSecrets) => Promise<CheckResult>;
   buffer?: ResultBuffer;
   scheduler?: Scheduler;
   metricsBuffer?: MetricsBuffer;
@@ -102,6 +103,18 @@ export interface RuntimeDeps {
   /** Where the guard's counts land, drained onto the poll line once a minute.
    * Supplied together with `egress` in production. */
   egressReport?: EgressReport;
+  /** The policy's mode, sent with the counts on every poll (REA-1013) so the
+   * server knows how many locations report and how many enforce. Omitted
+   * means no counts are sent, the pre-REA-1013 poll body. */
+  egressMode?: "report" | "enforce";
+  /** Where authenticated checks resolve their `${SECRET:NAME}` references
+   * (private locations phase 3). Omitted means none resolve, so an
+   * authenticated check fails naming the missing secret. */
+  secrets?: CheckSecrets;
+  /** This build's version and capabilities, sent on every poll. Omitted means
+   * the pre-phase-3 poll body, which the server answers by never serving an
+   * authenticated check in its authenticated form. */
+  selfReport?: AgentSelfReport;
 }
 
 export class AgentRuntime {
@@ -111,10 +124,13 @@ export class AgentRuntime {
   readonly bounds: AgentBounds;
   private readonly api: AgentApi;
   private readonly now: () => number;
-  private readonly execute: (check: AgentCheck, egress?: EgressGuard) => Promise<CheckResult>;
+  private readonly execute: (check: AgentCheck, egress?: EgressGuard, secrets?: CheckSecrets) => Promise<CheckResult>;
   private readonly metricsSource: MetricsSource;
   private readonly egress?: EgressGuard;
   private readonly egressReport: EgressReport;
+  private readonly egressMode?: "report" | "enforce";
+  private readonly secrets?: CheckSecrets;
+  private readonly selfReport?: AgentSelfReport;
   private readonly probeBudget: ProbeBudget;
 
   private nextPollAt = 0;
@@ -142,6 +158,9 @@ export class AgentRuntime {
     this.metricsSource = deps.metricsSource ?? new MetricsCollector(deps.metricsOptions);
     this.egress = deps.egress;
     this.egressReport = deps.egressReport ?? new EgressReport();
+    this.egressMode = deps.egressMode;
+    this.secrets = deps.secrets;
+    this.selfReport = deps.selfReport;
     this.probeBudget = new ProbeBudget(this.bounds.maxProbesPerMinute);
   }
 
@@ -197,8 +216,15 @@ export class AgentRuntime {
   }
 
   private async pollOnce(now: number): Promise<void> {
+    // Drained before the poll so the poll can carry them (REA-1013), and put
+    // back if it fails, so a dropped poll delays the numbers instead of
+    // losing them.
+    const egress = this.egressReport.drain();
     try {
-      const { checks: assigned, services, requestLogSnapshot } = await this.api.poll();
+      const { checks: assigned, services, requestLogSnapshot } = await this.api.poll(
+        this.egressMode ? { mode: this.egressMode, ...egress } : undefined,
+        this.selfReport,
+      );
       // The assigned-check ceiling (section 3.4). Truncated rather than
       // refused whole: a location running 250 of 300 assigned checks is
       // monitoring 250 things, and one that refuses the list is monitoring
@@ -233,7 +259,6 @@ export class AgentRuntime {
       // stream is the health surface, and everything a bound did in the last
       // minute is on it: the egress verdicts, the clamped cadences, the
       // truncated list.
-      const egress = this.egressReport.drain();
       log("info", "polled", {
         checks: checks.length,
         services: services.length || undefined,
@@ -248,6 +273,7 @@ export class AgentRuntime {
         egressByRule: egress.refused + egress.wouldRefuse > 0 ? egress.byRule : undefined,
       });
     } catch (err) {
+      this.egressReport.restore(egress);
       if (err instanceof AuthError) {
         this.nextPollAt = now + AUTH_RETRY_MS;
         log("error", "agent token rejected on poll", {
@@ -303,7 +329,7 @@ export class AgentRuntime {
     }
 
     const results = await mapWithConcurrency(admitted, this.bounds.maxConcurrentProbes, (check) =>
-      this.execute(check, this.egress),
+      this.execute(check, this.egress, this.secrets),
     );
     for (const result of results) this.buffer.push(result);
   }

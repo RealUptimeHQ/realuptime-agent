@@ -50,6 +50,50 @@ export interface AgentCheck {
   assertionJsonPath?: string | null;
   assertionJsonOp?: "equals" | "contains" | "exists" | null;
   assertionJsonValue?: string | null;
+  /**
+   * http only (private locations phase 3, `docs/private-probe-locations.md`
+   * section 3.6). Request headers and URL credentials that carry
+   * `${SECRET:NAME}` REFERENCES, never values: the server stores and sends
+   * the literal reference text, and this agent resolves each name from its
+   * own environment or secrets file at dial time (`secrets.ts`). Absent or
+   * null means an unauthenticated check, exact prior behaviour.
+   *
+   * Only ever sent to an agent whose poll declared the `secret_refs`
+   * capability. An agent built before this field existed gets the check with
+   * no url instead, so it fails loudly rather than probing without the
+   * credential it was configured with.
+   */
+  auth?: AgentCheckAuth | null;
+}
+
+/** The auth block of one http check. Every string is a template: literal
+ * text plus `${SECRET:NAME}` references, validated by `parseChecks` for
+ * shape and by `secrets.ts` for the positions and names it may use. */
+export interface AgentCheckAuth {
+  headers: AgentAuthHeader[];
+  /** `user:${SECRET:PASSWORD}`, sent as HTTP Basic credentials. Null when
+   * the check carries none. */
+  userinfo: string | null;
+}
+
+export interface AgentAuthHeader {
+  name: string;
+  value: string;
+}
+
+/**
+ * What this agent says about itself on every poll (private locations phase
+ * 3). The server uses it for two things only: whether an authenticated check
+ * may be served to this location in its authenticated form, and which extra
+ * header names the dashboard may offer for it. Names only: never a secret
+ * name, never a value, never a path.
+ */
+export interface AgentSelfReport {
+  version: string;
+  capabilities: string[];
+  /** The customer-declared header names from `REALUPTIME_SECRET_HEADERS`,
+   * beyond the four every agent allows. */
+  secretHeaderNames: string[];
 }
 
 /** One executed check, as posted to /results. */

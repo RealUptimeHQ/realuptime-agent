@@ -9,4 +9,18 @@
  * in sync with the `version` field in `package.json` by hand when either
  * changes.
  */
-export const AGENT_VERSION = "0.2.0";
+export const AGENT_VERSION = "0.4.0";
+
+/**
+ * What this build can do beyond the four probe verbs, declared on every poll
+ * (`AgentSelfReport`). A capability is a promise about how this agent treats
+ * a field, and the server withholds that field's content from any agent that
+ * did not declare it.
+ *
+ *   secret_refs   `auth` on an http check: `${SECRET:NAME}` references in
+ *                 request headers and URL credentials, resolved on this
+ *                 machine (secrets.ts). Since 0.4.0.
+ *
+ * Pinned to the server's own list by wire-contract.test.ts.
+ */
+export const AGENT_CAPABILITIES = ["secret_refs"] as const;

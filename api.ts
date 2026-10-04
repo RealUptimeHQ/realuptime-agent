@@ -2,7 +2,16 @@ import type { AgentConfig } from "./config.ts";
 import { FLUSH_BATCH_SIZE } from "./buffer.ts";
 import { METRICS_FLUSH_BATCH_SIZE } from "./metrics-buffer.ts";
 import { log } from "./log.ts";
-import type { AgentCheck, CheckResult, CheckType, MetricsRequest, MetricsResponse } from "./types.ts";
+import type {
+  AgentAuthHeader,
+  AgentCheck,
+  AgentCheckAuth,
+  AgentSelfReport,
+  CheckResult,
+  CheckType,
+  MetricsRequest,
+  MetricsResponse,
+} from "./types.ts";
 
 /**
  * The only network conversation this program has with anything other than the
@@ -66,8 +75,18 @@ export interface PollResult {
   requestLogSnapshot: boolean;
 }
 
+/** What a poll carries up (REA-1013): this location's egress mode and the
+ * verdicts since the last poll, so the dashboard can show what enforcement
+ * would cost before it becomes the default. Counts only, never a target. */
+export interface EgressPollReport {
+  mode: "report" | "enforce";
+  refused: number;
+  wouldRefuse: number;
+  byRule: Record<string, number>;
+}
+
 export interface AgentApi {
-  poll(): Promise<PollResult>;
+  poll(egress?: EgressPollReport, self?: AgentSelfReport): Promise<PollResult>;
   sendResults(results: CheckResult[]): Promise<void>;
   sendMetrics(request: MetricsRequest): Promise<MetricsResponse>;
 }
@@ -81,8 +100,14 @@ export class ApiClient implements AgentApi {
     this.fetchImpl = fetchImpl;
   }
 
-  async poll(): Promise<PollResult> {
-    const body = await this.post("/api/agent/v1/poll", {});
+  async poll(egress?: EgressPollReport, self?: AgentSelfReport): Promise<PollResult> {
+    // `agent` (phase 3): this build's version and capabilities, so the server
+    // serves an authenticated check in its authenticated form only to an
+    // agent that said it understands one.
+    const body = await this.post("/api/agent/v1/poll", {
+      ...(egress ? { egress } : {}),
+      ...(self ? { agent: self } : {}),
+    });
     return {
       checks: parseChecks(body),
       services: parseServiceWatch(body),
@@ -212,6 +237,22 @@ export const parseRules = {
    * verbatim, which is precisely the pass-through this vocabulary forbids.
    */
   dnsRecordTypes: ["A", "AAAA", "CNAME", "MX", "TXT", "NS"] as readonly string[],
+  /**
+   * The auth block of an http check (private locations phase 3, section 3.6):
+   * exactly these two keys, and each header exactly `name` and `value`. An
+   * unknown key anywhere inside it refuses the whole check, because a field
+   * this agent does not understand is precisely a field whose meaning it
+   * cannot promise to honour; a future auth form rides a new capability
+   * rather than a new key an old parser might half-read.
+   */
+  authKeys: ["headers", "userinfo"] as readonly string[],
+  authHeaderKeys: ["name", "value"] as readonly string[],
+  /** Header names are HTTP tokens (RFC 9110 section 5.6.2), bounded. Which
+   * names this location will actually send is decided at dial time, against
+   * this machine's own allowlist (`secrets.ts`), not here. */
+  authHeaderName: /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/ as RegExp,
+  maxAuthHeaders: 8,
+  maxAuthTemplateChars: 1024,
 };
 
 /**
@@ -250,6 +291,7 @@ export function parseChecks(body: unknown): AgentCheck[] {
 
   const checks: AgentCheck[] = [];
   let skipped = 0;
+  let skippedAuth = 0;
   for (const item of raw) {
     if (!item || typeof item !== "object") {
       skipped++;
@@ -258,6 +300,15 @@ export function parseChecks(body: unknown): AgentCheck[] {
     const c = item as Record<string, unknown>;
     if (typeof c.id !== "string" || !parseRules.checkTypes.includes(String(c.type))) {
       skipped++;
+      continue;
+    }
+    const auth = parseCheckAuth(c.type, c.auth);
+    if (auth === REFUSED_AUTH) {
+      // Refused whole, like an unknown verb: dialling this check without the
+      // block would send a request the customer configured to carry a
+      // credential with no credential at all, and dialling it with a
+      // half-understood block is the pass-through section 3.2 forbids.
+      skippedAuth++;
       continue;
     }
     checks.push({
@@ -289,6 +340,7 @@ export function parseChecks(body: unknown): AgentCheck[] {
           ? c.assertionJsonOp
           : null,
       assertionJsonValue: typeof c.assertionJsonValue === "string" ? c.assertionJsonValue : null,
+      auth,
     });
   }
 
@@ -298,7 +350,68 @@ export function parseChecks(body: unknown): AgentCheck[] {
       hint: "upgrade the agent image",
     });
   }
+  if (skippedAuth > 0) {
+    log("warn", "skipped checks whose authentication this agent does not understand", {
+      skipped: skippedAuth,
+      hint: "upgrade the agent image",
+    });
+  }
   return checks;
+}
+
+/** The parser's verdict on an auth block it will not run. A sentinel rather
+ * than null, because null is the ordinary "this check has no auth". */
+const REFUSED_AUTH = Symbol("refused auth");
+
+/** A template string the dialer may see: bounded, and free of every control
+ * character, so no value can smuggle a second header line in through a
+ * newline before the secret resolver ever looks at it. */
+function authTemplate(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  if (raw.length === 0 || raw.length > parseRules.maxAuthTemplateChars) return null;
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
+  if (/[\x00-\x1f\x7f]/.test(raw)) return null;
+  return raw;
+}
+
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  return Object.keys(value).every((key) => allowed.includes(key));
+}
+
+/**
+ * The `auth` block, strictly (section 3.2's allowlist rule applied to 3.6).
+ * Absent or null is an unauthenticated check. Anything else must be exactly
+ * the documented shape, on an http check, or the whole check is refused.
+ * Shape only: which header names this location sends, and whether each
+ * `${SECRET:NAME}` resolves, is decided at dial time by `secrets.ts`, where a
+ * refusal can become a failed result naming the reason.
+ */
+function parseCheckAuth(type: unknown, raw: unknown): AgentCheckAuth | null | typeof REFUSED_AUTH {
+  if (raw === undefined || raw === null) return null;
+  if (type !== "http" || typeof raw !== "object" || Array.isArray(raw)) return REFUSED_AUTH;
+  const block = raw as Record<string, unknown>;
+  if (!exactKeys(block, parseRules.authKeys)) return REFUSED_AUTH;
+
+  const rawHeaders = block.headers ?? [];
+  if (!Array.isArray(rawHeaders) || rawHeaders.length > parseRules.maxAuthHeaders) return REFUSED_AUTH;
+  const headers: AgentAuthHeader[] = [];
+  for (const entry of rawHeaders) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return REFUSED_AUTH;
+    const header = entry as Record<string, unknown>;
+    if (!exactKeys(header, parseRules.authHeaderKeys)) return REFUSED_AUTH;
+    if (typeof header.name !== "string" || !parseRules.authHeaderName.test(header.name)) return REFUSED_AUTH;
+    const value = authTemplate(header.value);
+    if (value === null) return REFUSED_AUTH;
+    headers.push({ name: header.name, value });
+  }
+
+  let userinfo: string | null = null;
+  if (block.userinfo !== undefined && block.userinfo !== null) {
+    userinfo = authTemplate(block.userinfo);
+    if (userinfo === null) return REFUSED_AUTH;
+  }
+  if (headers.length === 0 && userinfo === null) return null;
+  return { headers, userinfo };
 }
 
 /**

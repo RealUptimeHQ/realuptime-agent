@@ -57,6 +57,13 @@ export const httpRules = {
   isUp: (status: number): boolean => status >= 200 && status < 300,
 };
 
+/** The stored reason for a request that got no response in time, naming the
+ * limit. Same wording as the hosted probe (packages/checker/failure-reason.ts). */
+function timeoutReason(timeoutMs: number): string {
+  const seconds = Math.round(timeoutMs / 100) / 10;
+  return `No response within ${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+}
+
 export interface HttpOutcome {
   ok: boolean;
   statusCode?: number;
@@ -76,6 +83,13 @@ export async function runHttpCheck(
    * pre-guard behaviour: dial whatever the URL names. Supplied, it is asked
    * before the first request and again before every redirect hop. */
   egress?: EgressGuard,
+  /** Resolved request headers for an authenticated check (private locations
+   * phase 3), already built by `secrets.ts`'s `prepareCheckAuth`. Sent on
+   * the first request and on any redirect hop to the SAME origin, and never
+   * to another origin: a credential configured for `10.0.0.5:8443` is not
+   * handed to wherever that service chose to redirect, which is the rule
+   * browsers and curl follow for the same reason. */
+  authHeaders?: Record<string, string> | null,
 ): Promise<HttpOutcome> {
   const withAssertions = assertions && hasHttpAssertions(assertions) ? assertions : undefined;
   const started = Date.now();
@@ -85,10 +99,18 @@ export async function runHttpCheck(
   const deadline = started + timeoutMs;
 
   let current = url;
+  let credentialOrigin: string | null = null;
+  if (authHeaders) {
+    try {
+      credentialOrigin = new URL(url).origin;
+    } catch {
+      // Refused as "Invalid URL" on the first hop below.
+    }
+  }
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      return { ok: false, latencyMs: Date.now() - started, error: "The request timed out" };
+      return { ok: false, latencyMs: Date.now() - started, error: timeoutReason(timeoutMs) };
     }
 
     let target: URL;
@@ -125,12 +147,15 @@ export async function runHttpCheck(
         method: "GET",
         redirect: "manual",
         signal: controller.signal,
-        headers: { "user-agent": "RealUptime-Monitor-Agent" },
+        headers:
+          authHeaders && credentialOrigin !== null && target.origin === credentialOrigin
+            ? { ...authHeaders, "user-agent": "RealUptime-Monitor-Agent" }
+            : { "user-agent": "RealUptime-Monitor-Agent" },
       });
     } catch (err) {
       const latencyMs = Date.now() - started;
       if (controller.signal.aborted) {
-        return { ok: false, latencyMs, error: "The request timed out" };
+        return { ok: false, latencyMs, error: timeoutReason(timeoutMs) };
       }
       return { ok: false, latencyMs, error: describeFetchError(err) };
     } finally {

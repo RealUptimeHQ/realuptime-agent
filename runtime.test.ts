@@ -45,8 +45,13 @@ class FakeApi {
   services: string[] = [];
   requestLogSnapshot = false;
 
-  async poll(): Promise<{ checks: AgentCheck[]; services: string[]; requestLogSnapshot: boolean }> {
+  pollEgress: unknown[] = [];
+  pollSelf: unknown[] = [];
+
+  async poll(egress?: unknown, self?: unknown): Promise<{ checks: AgentCheck[]; services: string[]; requestLogSnapshot: boolean }> {
     this.pollCalls++;
+    this.pollEgress.push(egress);
+    this.pollSelf.push(self);
     if (this.pollError) throw this.pollError;
     return { checks: this.checks, services: this.services, requestLogSnapshot: this.requestLogSnapshot };
   }
@@ -830,6 +835,68 @@ describe("AgentRuntime: the egress guard", () => {
       .map((l) => JSON.parse(l) as { msg: string; egressWouldRefuse?: number })
       .find((r) => r.msg === "polled");
     expect(line?.egressWouldRefuse).toBe(1);
+  });
+});
+
+describe("AgentRuntime: egress counts on the poll (REA-1013)", () => {
+  it("sends the mode and the counts since the last poll, and keeps them through a failed poll", async () => {
+    const api = new FakeApi();
+    const report = new EgressReport();
+    let now = 0;
+    const runtime = new AgentRuntime({
+      api,
+      now: () => now,
+      egress: async () => ({ proceed: true, addresses: [] }),
+      egressReport: report,
+      egressMode: "report",
+    });
+
+    report.record({ allow: false, enforced: false, rule: "public", detail: "x" });
+    api.pollError = new Error("network down");
+    await runtime.tick();
+    expect(api.pollEgress[0]).toEqual({ mode: "report", refused: 0, wouldRefuse: 1, byRule: { public: 1 } });
+
+    // The failed poll's counts ride the next one, added to what came after.
+    report.record({ allow: false, enforced: false, rule: "public", detail: "y" });
+    api.pollError = null;
+    now = 10 * 60_000;
+    await runtime.tick();
+    expect(api.pollEgress[1]).toEqual({ mode: "report", refused: 0, wouldRefuse: 2, byRule: { public: 2 } });
+  });
+
+  it("sends nothing extra when no egress mode is configured", async () => {
+    const api = new FakeApi();
+    const runtime = new AgentRuntime({ api, now: () => 0 });
+    await runtime.tick();
+    expect(api.pollEgress[0]).toBeUndefined();
+  });
+});
+
+describe("AgentRuntime: authenticated checks (private locations phase 3)", () => {
+  it("declares this build's version and capabilities on every poll", async () => {
+    const api = new FakeApi();
+    const selfReport = { version: "0.4.0", capabilities: ["secret_refs"], secretHeaderNames: [] };
+    const runtime = new AgentRuntime({ api, now: () => 0, selfReport });
+    await runtime.tick();
+    expect(api.pollSelf[0]).toEqual(selfReport);
+  });
+
+  it("hands the location's secrets to every probe it runs", async () => {
+    const api = new FakeApi();
+    api.checks = [check("a")];
+    const seen: unknown[] = [];
+    const secrets = { source: { lookup: () => undefined }, allowedHeaderNames: ["authorization"] };
+    const runtime = new AgentRuntime({
+      api,
+      now: () => 0,
+      secrets,
+      execute: async (c, _egress, s) => {
+        seen.push(s);
+        return { checkId: c.id, ok: true, checkedAt: new Date(0).toISOString() };
+      },
+    });
+    await runtime.tick();
+    expect(seen).toEqual([secrets]);
   });
 });
 
