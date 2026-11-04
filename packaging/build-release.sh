@@ -10,7 +10,11 @@
 #   realuptime-agent-<ver>.tgz   dist/ + package.json, the thing install.sh
 #                                unpacks under /opt/realuptime-agent
 #   realuptime-agent-<ver>.zip   the same tree, for install-windows.ps1
-#   SHA256SUMS                   over both archives
+#   realuptime-agent-<ver>-linux-x64, -linux-arm64
+#                                standalone executables with Node.js built
+#                                in (build-binary.sh), which install.sh uses
+#                                on a host with neither Node.js nor Docker
+#   SHA256SUMS                   over the archives and the executables
 #   SHA256SUMS.sig               cosign signature over SHA256SUMS (--sign,
 #                                needs COSIGN_KEY pointing at the private key
 #                                whose public half is served at
@@ -47,7 +51,10 @@ else
   echo "zip not installed; skipping the Windows archive"
 fi
 
-( cd "$OUT" && sha256sum realuptime-agent-"$VERSION".tgz realuptime-agent-"$VERSION".zip 2>/dev/null > SHA256SUMS || sha256sum realuptime-agent-"$VERSION".tgz > SHA256SUMS )
+REALUPTIME_AGENT_BINARY_TARGETS="linux-x64 linux-arm64" sh "$HERE/build-binary.sh"
+
+( cd "$OUT" && sha256sum realuptime-agent-"$VERSION".tgz realuptime-agent-"$VERSION".zip realuptime-agent-"$VERSION"-linux-x64 realuptime-agent-"$VERSION"-linux-arm64 2>/dev/null > SHA256SUMS \
+    || sha256sum realuptime-agent-"$VERSION".tgz realuptime-agent-"$VERSION"-linux-x64 realuptime-agent-"$VERSION"-linux-arm64 > SHA256SUMS )
 
 if [ "$SIGN" -eq 1 ]; then
   [ -n "${COSIGN_KEY:-}" ] || { echo "--sign needs COSIGN_KEY" >&2; exit 1; }

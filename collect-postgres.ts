@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, createHmac, pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
 import * as net from "node:net";
 import type { PostgresSample } from "./types.ts";
 
@@ -36,12 +36,14 @@ import type { PostgresSample } from "./types.ts";
  *
  * ## Authentication
  *
- * Trust, cleartext password and MD5 are supported -- the three methods a
- * self-hosted Postgres a customer controls is commonly configured with for
- * a dedicated monitoring role. SCRAM-SHA-256 (the default `pg_hba.conf`
- * method since Postgres 14) is NOT implemented in this phase and is refused
- * with a message naming the gap rather than a cryptic protocol error;
- * REA-440's follow-up ships it. TLS is likewise not implemented: the DSN is
+ * Trust (including peer auth over a unix socket), cleartext password, MD5
+ * and SCRAM-SHA-256 are supported. SCRAM-SHA-256 is the default
+ * `password_encryption` and `pg_hba.conf` method since Postgres 14, so a
+ * monitoring role created the ordinary way on any current server uses it.
+ * It is implemented per RFC 5802 / RFC 7677 without channel binding (the
+ * `SCRAM-SHA-256-PLUS` variant needs TLS, below), and the server's final
+ * signature is verified, so a server that does not know the password
+ * cannot complete the exchange. TLS is not implemented: the DSN is
  * expected to point at an instance reachable without one (typically
  * localhost or the same private network the agent already runs on).
  *
@@ -113,6 +115,98 @@ export function md5PasswordResponse(user: string, password: string, salt: Buffer
   const inner = md5Hex(password + user);
   const outer = md5Hex(Buffer.concat([Buffer.from(inner, "utf8"), salt]));
   return `md5${outer}`;
+}
+
+const SCRAM_MECHANISM = "SCRAM-SHA-256";
+
+function hmac(key: Buffer, data: string): Buffer {
+  return createHmac("sha256", key).update(data, "utf8").digest();
+}
+
+/** The client's state across one SCRAM-SHA-256 exchange (RFC 5802). The
+ * user name in the client-first message is empty, as libpq sends it:
+ * Postgres takes the role from the startup message and ignores `n=`. */
+export interface ScramClient {
+  clientNonce: string;
+  clientFirstBare: string;
+}
+
+export function scramClientFirst(clientNonce: string = randomBytes(18).toString("base64")): {
+  client: ScramClient;
+  message: string;
+} {
+  const clientFirstBare = `n=,r=${clientNonce}`;
+  return { client: { clientNonce, clientFirstBare }, message: `n,,${clientFirstBare}` };
+}
+
+/** Answers the server-first message with the client-final message, and
+ * returns the server signature the server-final message must carry. */
+export function scramClientFinal(
+  client: ScramClient,
+  password: string,
+  serverFirst: string,
+): { message: string; expectedServerSignature: string } {
+  const attrs = new Map(
+    serverFirst.split(",").map((part) => [part.slice(0, 1), part.slice(2)] as const),
+  );
+  const nonce = attrs.get("r");
+  const salt = attrs.get("s");
+  const iterations = Number(attrs.get("i"));
+  if (!nonce || !salt || !Number.isInteger(iterations) || iterations < 1) {
+    throw new Error("malformed SCRAM server-first message");
+  }
+  if (!nonce.startsWith(client.clientNonce)) {
+    throw new Error("SCRAM server nonce does not extend the client nonce");
+  }
+  const saltedPassword = pbkdf2Sync(
+    password.normalize("NFKC"),
+    Buffer.from(salt, "base64"),
+    iterations,
+    32,
+    "sha256",
+  );
+  const clientKey = hmac(saltedPassword, "Client Key");
+  const storedKey = createHash("sha256").update(clientKey).digest();
+  const clientFinalWithoutProof = `c=biws,r=${nonce}`;
+  const authMessage = `${client.clientFirstBare},${serverFirst},${clientFinalWithoutProof}`;
+  const clientSignature = hmac(storedKey, authMessage);
+  const proof = Buffer.alloc(clientKey.length);
+  for (let i = 0; i < proof.length; i++) proof[i] = clientKey[i]! ^ clientSignature[i]!;
+  const serverSignature = hmac(hmac(saltedPassword, "Server Key"), authMessage);
+  return {
+    message: `${clientFinalWithoutProof},p=${proof.toString("base64")}`,
+    expectedServerSignature: serverSignature.toString("base64"),
+  };
+}
+
+/** Checks the server-final message (`v=<signature>`) against the signature
+ * the client computed. A server that does not hold the password's verifier
+ * cannot produce it. */
+export function scramServerFinalValid(serverFinal: string, expectedServerSignature: string): boolean {
+  const match = /(?:^|,)v=([^,]+)/.exec(serverFinal);
+  if (!match) return false;
+  const got = Buffer.from(match[1]!, "base64");
+  const want = Buffer.from(expectedServerSignature, "base64");
+  return got.length === want.length && timingSafeEqual(got, want);
+}
+
+function buildSaslInitialResponse(mechanism: string, data: string): Buffer {
+  const mech = Buffer.from(`${mechanism}\0`, "utf8");
+  const payload = Buffer.from(data, "utf8");
+  const header = Buffer.alloc(5);
+  header[0] = 0x70; // 'p'
+  header.writeInt32BE(4 + mech.length + 4 + payload.length, 1);
+  const len = Buffer.alloc(4);
+  len.writeInt32BE(payload.length, 0);
+  return Buffer.concat([header, mech, len, payload]);
+}
+
+function buildSaslResponse(data: string): Buffer {
+  const payload = Buffer.from(data, "utf8");
+  const header = Buffer.alloc(5);
+  header[0] = 0x70; // 'p'
+  header.writeInt32BE(4 + payload.length, 1);
+  return Buffer.concat([header, payload]);
 }
 
 function buildStartupMessage(user: string, database: string): Buffer {
@@ -239,6 +333,7 @@ async function authenticate(
   user: string,
   password: string,
 ): Promise<void> {
+  let scram: { client: ScramClient; expectedServerSignature: string | null } | null = null;
   for (;;) {
     const msg = await reader.next();
     if (msg.type === "E") {
@@ -247,7 +342,14 @@ async function authenticate(
     if (msg.type === "Z") return; // ReadyForQuery: authenticated (trust, or auth already accepted)
     if (msg.type === "R") {
       const authType = msg.payload.readInt32BE(0);
-      if (authType === 0) continue; // AuthenticationOk; keep reading to ReadyForQuery
+      if (authType === 0) {
+        // AuthenticationOk; keep reading to ReadyForQuery. A SCRAM exchange
+        // must have ended in a verified server signature first.
+        if (scram && scram.expectedServerSignature !== null) {
+          throw new Error("postgres accepted SCRAM authentication without proving the password");
+        }
+        continue;
+      }
       if (authType === 3) {
         socket.write(buildPasswordMessage(password));
         continue;
@@ -257,8 +359,39 @@ async function authenticate(
         socket.write(buildPasswordMessage(md5PasswordResponse(user, password, salt)));
         continue;
       }
+      if (authType === 10) {
+        // AuthenticationSASL: a list of null-terminated mechanism names.
+        const mechanisms = msg.payload.toString("utf8", 4).split("\0").filter(Boolean);
+        if (!mechanisms.includes(SCRAM_MECHANISM)) {
+          throw new Error(
+            `postgres offered no supported SASL mechanism (${mechanisms.join(", ") || "none"}); this agent supports ${SCRAM_MECHANISM}`,
+          );
+        }
+        const first = scramClientFirst();
+        scram = { client: first.client, expectedServerSignature: null };
+        socket.write(buildSaslInitialResponse(SCRAM_MECHANISM, first.message));
+        continue;
+      }
+      if (authType === 11) {
+        // AuthenticationSASLContinue: the server-first message.
+        if (!scram) throw new Error("postgres sent SASLContinue before SASL");
+        const final = scramClientFinal(scram.client, password, msg.payload.toString("utf8", 4));
+        scram.expectedServerSignature = final.expectedServerSignature;
+        socket.write(buildSaslResponse(final.message));
+        continue;
+      }
+      if (authType === 12) {
+        // AuthenticationSASLFinal: the server's signature, verified before
+        // anything is read from this connection.
+        if (!scram?.expectedServerSignature) throw new Error("postgres sent SASLFinal out of order");
+        if (!scramServerFinalValid(msg.payload.toString("utf8", 4), scram.expectedServerSignature)) {
+          throw new Error("postgres SCRAM server signature did not verify");
+        }
+        scram.expectedServerSignature = null;
+        continue;
+      }
       throw new Error(
-        `unsupported postgres authentication method (code ${authType}); only trust, cleartext password and md5 are supported in this agent version`,
+        `unsupported postgres authentication method (code ${authType}); this agent supports trust, cleartext password, md5 and SCRAM-SHA-256`,
       );
     }
     // NoticeResponse, ParameterStatus, BackendKeyData: not needed here.
@@ -359,7 +492,7 @@ const QUERY_BATCH = [
   // pg_stat_activity so the two do not cost two round trips.
   `select
      count(*) filter (where pid <> pg_backend_pid())::int as connections,
-     coalesce(extract(epoch from max(now() - query_start)) filter (where state = 'active' and pid <> pg_backend_pid()), 0)::double precision as longest_query_seconds
+     coalesce(extract(epoch from max(now() - query_start) filter (where state = 'active' and pid <> pg_backend_pid())), 0)::double precision as longest_query_seconds
    from pg_stat_activity`,
   // 2: the configured ceiling connections is measured against.
   `select setting::int as max_connections from pg_settings where name = 'max_connections'`,
@@ -409,13 +542,18 @@ function connectSocket(opts: PostgresConnectOptions): Promise<net.Socket> {
       reject(err);
     };
     socket.once("error", onError);
+    const onIdle = () => onError(new Error("postgres connection timed out"));
     socket.once("connect", () => {
       socket.off("error", onError);
+      // The idle timer bounds the connect only. Left armed, it destroyed the
+      // socket whenever the query batch went quiet for longer than this,
+      // which pg_database_size over many databases does; the batch has its
+      // own QUERY_TIMEOUT_MS in collect().
+      socket.setTimeout(0);
+      socket.off("timeout", onIdle);
       resolve(socket);
     });
-    socket.setTimeout(CONNECT_TIMEOUT_MS, () =>
-      onError(new Error("postgres connection timed out")),
-    );
+    socket.setTimeout(CONNECT_TIMEOUT_MS, onIdle);
   });
 }
 
@@ -451,7 +589,7 @@ export class PostgresCollector {
     }
     try {
       const reader = new PgMessageReader(socket);
-      socket.write(buildStartupMessage(opts.user, opts.password));
+      socket.write(buildStartupMessage(opts.user, opts.database));
       await withTimeout(
         authenticate(reader, socket, opts.user, opts.password),
         CONNECT_TIMEOUT_MS,

@@ -24,13 +24,16 @@ curl -fsSL https://realuptime.io/agent/install.sh | REALUPTIME_TOKEN=rua_your_to
 
 When the installer cannot pull the image (the registry denies the pull, the
 host's architecture is not one the image carries, no route to `ghcr.io`) it
-says so and installs the release binary instead, which needs only Node.js 22+
-and no Docker. `--method systemd` skips Docker even where it works.
+says so and installs the release binary instead. `--method systemd` skips
+Docker even where it works. With Node.js 22+ on the machine that is the small
+release tarball; without it (typical on a database server) it is the
+standalone executable for x86_64 or arm64, which has Node.js built in and
+needs nothing installed, verified against the same signed `SHA256SUMS`.
 
 Docker, one command:
 
 ```
-docker run -d --name realuptime-agent --restart unless-stopped --network host -e REALUPTIME_TOKEN=rua_your_token_here ghcr.io/realuptimehq/agent:latest
+docker run -d --name realuptime-agent --restart unless-stopped --network host --pid host -v /:/host:ro -e REALUPTIME_TOKEN=rua_your_token_here ghcr.io/realuptimehq/agent:latest
 ```
 
 `--network host` is part of the command, not an option (REA-780). An agent
@@ -42,6 +45,12 @@ to watch. The agent detects the isolated case from `/sys/class/net` and
 `/proc/net/route` (`host-network.ts`), logs it at startup, and reports it
 with its host identity so the dashboard can explain the refusal instead of
 repeating it.
+
+`--pid host -v /:/host:ro` is part of it for the same reason. Inside its own
+container the agent would read the container's cgroup and overlay
+filesystem and report vantage "container"; with the machine's root mounted
+read-only at `/host` it reads the host's `/proc`, `/sys` and filesystems and
+reports the server, the same way the Kubernetes DaemonSet does.
 
 The token is shown once, when you register the agent in the RealUptime
 dashboard. If you lose it, issue a new one: tokens are stored hashed, so
@@ -79,6 +88,10 @@ services:
   realuptime-agent:
     image: ghcr.io/realuptimehq/agent:latest
     restart: unless-stopped
+    network_mode: host
+    pid: host
+    volumes:
+      - /:/host:ro
     environment:
       REALUPTIME_TOKEN: rua_your_token_here
 ```
@@ -418,9 +431,10 @@ that instance every tick, alongside the OS-level sample:
 - Replication lag, when this instance has replicas.
 
 A role with `pg_monitor` (or superuser) can read every one of these; none of
-them touches your table data. Authentication supports trust, cleartext
-password, and MD5; SCRAM-SHA-256 (the Postgres 14+ default) is not yet
-supported. There is no TLS support in this version: point the DSN at an
+them touches your table data. Authentication supports trust (including
+peer authentication over a unix socket), cleartext password, MD5 and
+SCRAM-SHA-256, the Postgres 14+ default. There is no TLS support in this
+version: point the DSN at an
 instance reachable without one, typically `localhost` or the same private
 network the agent already runs on. A DSN that is present but unreachable
 (wrong password, database down) costs that tick's PostgreSQL reading only:

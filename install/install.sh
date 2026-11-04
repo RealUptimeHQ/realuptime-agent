@@ -26,8 +26,9 @@ INSTALLER_SCRIPT_VERSION="5"
 #      pick, so a registry that denies it, a host architecture the image does
 #      not carry, or no route to ghcr.io never sends the install down a path
 #      that cannot finish), otherwise a systemd service running the release
-#      tarball under Node.js 22+. A host that can do neither fails
-#      immediately with a message naming both problems, before any download.
+#      tarball under Node.js 22+, or, with no Node.js 22+ on the machine, the
+#      release's standalone executable for its architecture, which has
+#      Node.js built in.
 #   2. Systemd path: resolves the release tag from the PUBLIC mirror
 #      repository's own releases via the GitHub API, filtered to `agent-*`
 #      tags (REA-601 -- never the monorepo's own `/releases/latest`: that
@@ -222,11 +223,7 @@ if [ -z "$METHOD" ]; then
       METHOD=docker
     else
       METHOD=systemd
-      if node_ok; then
-        say "could not pull $IMAGE (${pull_why:-no reason given}); installing the release binary instead"
-      else
-        die "could not pull $IMAGE (${pull_why:-no reason given}) and Node.js 22 or newer is not installed, so there is no way to install the agent here. Install Node.js 22+ and run this again, or fix access to the image."
-      fi
+      say "could not pull $IMAGE (${pull_why:-no reason given}); installing the release binary instead"
     fi
   else
     METHOD=systemd
@@ -278,7 +275,13 @@ install_docker() {
   # one such check produced 2,819 failures against 22 successes in a day. This
   # installer's whole job is to put the agent where it can see the machine, so
   # the flag is part of the command and not a documented option.
-  if run_out="$(docker run -d --name realuptime-agent --restart unless-stopped --network host --env-file "$tmp" "$IMAGE" 2>&1)"; then
+  # --pid host and the read-only / at /host, for the same reason: without
+  # them the container reads its own cgroup and overlay filesystem, reports
+  # vantage "container", and the server refuses those metrics for an agent
+  # already pinned to "host". With /host/proc/stat present the collector
+  # reads the machine's /proc, /sys and filesystems (collect-linux.ts), the
+  # same mount the Kubernetes DaemonSet uses.
+  if run_out="$(docker run -d --name realuptime-agent --restart unless-stopped --network host --pid host -v /:/host:ro --env-file "$tmp" "$IMAGE" 2>&1)"; then
     rm -f "$tmp"
   else
     rm -f "$tmp"
@@ -325,27 +328,54 @@ verify_release() {
   fi
 }
 
+# The standalone executable's architecture suffix for this machine, or
+# nothing when no build exists for it (build-binary.sh).
+binary_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo x64 ;;
+    aarch64|arm64) echo arm64 ;;
+    *) echo "" ;;
+  esac
+}
+
 install_systemd() {
   need curl; need tar; need systemctl
-  command -v node >/dev/null 2>&1 || die "Node.js 22 or newer is required for the systemd install (or install Docker)"
-  major="$(node -p 'process.versions.node.split(".")[0]')"
-  [ "$major" -ge 22 ] || die "Node.js $major found; 22 or newer is required"
 
   tag="$(resolve_agent_tag)" || exit 1
+  version="${tag#agent-}"
   work="$(mktemp -d)"
-  tarball="$work/realuptime-agent-${tag#agent-}.tgz"
-  say "downloading $tag"
-  curl -fsSL -o "$tarball" "$RELEASE_BASE/$tag/realuptime-agent-${tag#agent-}.tgz"
   curl -fsSL -o "$work/SHA256SUMS" "$RELEASE_BASE/$tag/SHA256SUMS"
   curl -fsSL -o "$work/SHA256SUMS.sig" "$RELEASE_BASE/$tag/SHA256SUMS.sig" || : > "$work/SHA256SUMS.sig"
-  verify_release "$tarball" "$work/SHA256SUMS" "$work/SHA256SUMS.sig"
+
+  # Node.js 22+ on the machine runs the small tarball. Without it (most
+  # database servers have neither Node.js nor Docker), the release's
+  # standalone executable carries its own Node.js and needs nothing else.
+  if node_ok; then
+    artifact="realuptime-agent-$version.tgz"
+  else
+    arch="$(binary_arch)"
+    artifact="realuptime-agent-$version-linux-$arch"
+    if [ -z "$arch" ] || ! grep -q " $artifact\$" "$work/SHA256SUMS"; then
+      die "Node.js 22 or newer is not installed and $tag has no standalone build for $(uname -m). Install Node.js 22+ or Docker and run this again."
+    fi
+  fi
+  say "downloading $tag ($artifact)"
+  curl -fsSL -o "$work/$artifact" "$RELEASE_BASE/$tag/$artifact"
+  verify_release "$work/$artifact" "$work/SHA256SUMS" "$work/SHA256SUMS.sig"
 
   if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     as_root useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null \
       || as_root adduser --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
   fi
   as_root mkdir -p "$INSTALL_DIR" "$ENV_DIR"
-  as_root tar -xzf "$tarball" -C "$INSTALL_DIR" --strip-components=1
+  if node_ok; then
+    as_root tar -xzf "$work/$artifact" -C "$INSTALL_DIR" --strip-components=1
+    exec_start="$(command -v node) $INSTALL_DIR/dist/agent.js"
+  else
+    as_root mkdir -p "$INSTALL_DIR/bin"
+    as_root install -m 0755 "$work/$artifact" "$INSTALL_DIR/bin/realuptime-agent"
+    exec_start="$INSTALL_DIR/bin/realuptime-agent"
+  fi
   as_root chown -R root:root "$INSTALL_DIR"
 
   tmp="$(mktemp)"
@@ -353,7 +383,6 @@ install_systemd() {
   as_root install -m 0600 -o root -g root "$tmp" "$ENV_FILE"
   rm -f "$tmp"
 
-  node_bin="$(command -v node)"
   tmpunit="$(mktemp)"
   cat > "$tmpunit" <<UNIT
 [Unit]
@@ -363,7 +392,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=$node_bin $INSTALL_DIR/dist/agent.js
+ExecStart=$exec_start
 EnvironmentFile=$ENV_FILE
 User=$SERVICE_USER
 Restart=always

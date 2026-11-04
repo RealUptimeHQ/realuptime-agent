@@ -541,11 +541,16 @@ function connectSocket(opts: MysqlConnectOptions): Promise<net.Socket> {
       reject(err);
     };
     socket.once("error", onError);
+    const onIdle = () => onError(new Error("mysql connection timed out"));
     socket.once("connect", () => {
       socket.off("error", onError);
+      // The idle timer bounds the connect only; left armed it would destroy
+      // the socket mid-read (same fix as collect-postgres.ts).
+      socket.setTimeout(0);
+      socket.off("timeout", onIdle);
       resolve(socket);
     });
-    socket.setTimeout(CONNECT_TIMEOUT_MS, () => onError(new Error("mysql connection timed out")));
+    socket.setTimeout(CONNECT_TIMEOUT_MS, onIdle);
   });
 }
 

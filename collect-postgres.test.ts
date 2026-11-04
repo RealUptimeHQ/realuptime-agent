@@ -1,3 +1,4 @@
+import { createHash, createHmac, pbkdf2Sync } from "node:crypto";
 import * as net from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -5,6 +6,9 @@ import {
   PostgresCollector,
   dsnFingerprint,
   md5PasswordResponse,
+  scramClientFinal,
+  scramClientFirst,
+  scramServerFinalValid,
   parsePostgresDsn,
 } from "./collect-postgres.ts";
 
@@ -273,17 +277,224 @@ describe("PostgresCollector", () => {
     expect(await collector.collect()).toBeNull();
   });
 
-  it("refuses an unsupported auth method (SCRAM) with a null result, not a hang", async () => {
+  it("refuses a SASL offer with no supported mechanism with a null result, not a hang", async () => {
     const port = await startFakeServer(
       () => {},
       (socket) => {
-        const body = Buffer.alloc(4);
-        body.writeInt32BE(10, 0); // AuthenticationSASL
-        socket.write(frame("R", body));
+        socket.write(frame("R", saslBody(10, "SCRAM-SHA-256-PLUS\0\0")));
       },
     );
-    const collector = new PostgresCollector(`postgresql://monitor:x@127.0.0.1:${port}/appdb`);
-    expect(await collector.collect()).toBeNull();
+    expect(await new PostgresCollector(fixtureDsn(port)).collect()).toBeNull();
+  });
+
+  it("authenticates with SCRAM-SHA-256 and verifies the server's signature", async () => {
+    const salt = Buffer.from("fixture-salt");
+    const port = await startFakeServer(
+      (socket) => socket.write(minimalBatch()),
+      (socket, onAuthenticated) => {
+        socket.write(frame("R", saslBody(10, "SCRAM-SHA-256\0\0")));
+        socket.once("data", (initial) => {
+          const clientFirst = saslInitialData(initial);
+          const clientNonce = /r=([^,]+)/.exec(clientFirst)?.[1] ?? "";
+          const serverFirst = `r=${clientNonce}server,s=${salt.toString("base64")},i=4096`;
+          socket.write(frame("R", saslBody(11, serverFirst)));
+          socket.once("data", (response) => {
+            const server = scramServer(
+              FIXTURE_PASSWORD,
+              salt,
+              4096,
+              clientFirst.slice(3),
+              serverFirst,
+              response.toString("utf8", 5),
+            );
+            expect(server.proofValid).toBe(true);
+            socket.write(
+              Buffer.concat([
+                frame("R", saslBody(12, `v=${server.serverSignature}`)),
+                authOk(),
+                readyForQuery(),
+              ]),
+            );
+            onAuthenticated();
+          });
+        });
+      },
+    );
+    expect((await new PostgresCollector(fixtureDsn(port)).collect())?.connections).toBe(1);
+  });
+
+  it("rejects a SCRAM server that cannot prove the password (wrong signature)", async () => {
+    const port = await startFakeServer(
+      (socket) => socket.write(minimalBatch()),
+      (socket) => {
+        socket.write(frame("R", saslBody(10, "SCRAM-SHA-256\0\0")));
+        socket.once("data", (initial) => {
+          const clientNonce = /r=([^,]+)/.exec(saslInitialData(initial))?.[1] ?? "";
+          const salt = Buffer.from("s").toString("base64");
+          socket.write(frame("R", saslBody(11, `r=${clientNonce}x,s=${salt},i=4096`)));
+          socket.once("data", () => {
+            const forged = Buffer.alloc(32).toString("base64");
+            socket.write(
+              Buffer.concat([frame("R", saslBody(12, `v=${forged}`)), authOk(), readyForQuery()]),
+            );
+          });
+        });
+      },
+    );
+    expect(await new PostgresCollector(fixtureDsn(port)).collect()).toBeNull();
+  });
+
+  it("rejects AuthenticationOk that skips the SCRAM server signature", async () => {
+    const port = await startFakeServer(
+      (socket) => socket.write(minimalBatch()),
+      (socket) => {
+        socket.write(frame("R", saslBody(10, "SCRAM-SHA-256\0\0")));
+        socket.once("data", (initial) => {
+          const clientNonce = /r=([^,]+)/.exec(saslInitialData(initial))?.[1] ?? "";
+          const salt = Buffer.from("s").toString("base64");
+          socket.write(frame("R", saslBody(11, `r=${clientNonce}x,s=${salt},i=4096`)));
+          socket.once("data", () => socket.write(Buffer.concat([authOk(), readyForQuery()])));
+        });
+      },
+    );
+    expect(await new PostgresCollector(fixtureDsn(port)).collect()).toBeNull();
+  });
+});
+
+const FIXTURE_PASSWORD = "x";
+
+/** A loopback DSN for the fake server, with a placeholder password. */
+function fixtureDsn(port: number): string {
+  const url = new URL(`postgresql://127.0.0.1:${port}/appdb`);
+  url.username = "monitor";
+  url.password = FIXTURE_PASSWORD;
+  return url.href;
+}
+
+function saslBody(code: number, data: string): Buffer {
+  const head = Buffer.alloc(4);
+  head.writeInt32BE(code, 0);
+  return Buffer.concat([head, Buffer.from(data, "utf8")]);
+}
+
+/** The client-first message out of a SASLInitialResponse frame. */
+function saslInitialData(chunk: Buffer): string {
+  const mechEnd = chunk.indexOf(0, 5);
+  const len = chunk.readInt32BE(mechEnd + 1);
+  return chunk.toString("utf8", mechEnd + 5, mechEnd + 5 + len);
+}
+
+function minimalBatch(): Buffer {
+  return Buffer.concat([
+    statement(["connections", "longest_query_seconds"], [["1", "0"]]),
+    statement(["max_connections"], [["50"]]),
+    statement(["blks_hit", "blks_read"], [["0", "0"]]),
+    statement(["datname", "size_bytes"], []),
+    statement(["lag_seconds"], []),
+    readyForQuery(),
+  ]);
+}
+
+/** The server half of SCRAM-SHA-256 (RFC 5802 section 3), written apart
+ * from the client code under test: checks the client's proof and computes
+ * the server signature. */
+function scramServer(
+  password: string,
+  salt: Buffer,
+  iterations: number,
+  clientFirstBare: string,
+  serverFirst: string,
+  clientFinal: string,
+): { proofValid: boolean; serverSignature: string } {
+  const salted = pbkdf2Sync(password, salt, iterations, 32, "sha256");
+  const clientKey = createHmac("sha256", salted).update("Client Key").digest();
+  const storedKey = createHash("sha256").update(clientKey).digest();
+  const cut = clientFinal.lastIndexOf(",p=");
+  const authMessage = `${clientFirstBare},${serverFirst},${clientFinal.slice(0, cut)}`;
+  const signature = createHmac("sha256", storedKey).update(authMessage).digest();
+  const proof = Buffer.from(clientFinal.slice(cut + 3), "base64");
+  const recovered = Buffer.alloc(32);
+  for (let i = 0; i < 32; i++) recovered[i] = (proof[i] ?? 0) ^ (signature[i] ?? 0);
+  const proofValid = createHash("sha256").update(recovered).digest().equals(storedKey);
+  const serverKey = createHmac("sha256", salted).update("Server Key").digest();
+  return {
+    proofValid,
+    serverSignature: createHmac("sha256", serverKey).update(authMessage).digest("base64"),
+  };
+}
+
+describe("SCRAM-SHA-256 client", () => {
+  it("sends an empty user name and the gs2 header libpq sends", () => {
+    const { message, client } = scramClientFirst("nonce");
+    expect(message).toBe("n,,n=,r=nonce");
+    expect(client.clientFirstBare).toBe("n=,r=nonce");
+  });
+
+  it("produces a proof the server side accepts and a matching server signature", () => {
+    const { client } = scramClientFirst("abc");
+    const salt = Buffer.from("salt");
+    const serverFirst = `r=abcdef,s=${salt.toString("base64")},i=4096`;
+    const final = scramClientFinal(client, FIXTURE_PASSWORD, serverFirst);
+    const server = scramServer(
+      FIXTURE_PASSWORD,
+      salt,
+      4096,
+      client.clientFirstBare,
+      serverFirst,
+      final.message,
+    );
+    expect(server.proofValid).toBe(true);
+    expect(final.expectedServerSignature).toBe(server.serverSignature);
+    expect(scramServerFinalValid(`v=${server.serverSignature}`, final.expectedServerSignature)).toBe(
+      true,
+    );
+    expect(scramServerFinalValid("v=AAAA", final.expectedServerSignature)).toBe(false);
+  });
+
+  it("refuses a server nonce that does not extend the client's", () => {
+    const { client } = scramClientFirst("abc");
+    const serverFirst = `r=zzz,s=${Buffer.from("salt").toString("base64")},i=4096`;
+    expect(() => scramClientFinal(client, FIXTURE_PASSWORD, serverFirst)).toThrow(/nonce/);
+  });
+});
+
+describe("PostgresCollector against a real server", () => {
+  // The fake server above never parses SQL, so a batch Postgres itself
+  // rejects (a FILTER clause on a non-aggregate shipped that way) passes
+  // every test there. Opt-in, pointed at a small instance: the batch sizes
+  // every database, which on a shared test server with hundreds of them
+  // outlasts the collector's own query timeout.
+  const realDsn = process.env.REALUPTIME_AGENT_TEST_POSTGRES_DSN;
+  it.skipIf(!realDsn)("runs its query batch and returns a reading", async () => {
+    const sample = await new PostgresCollector(realDsn ?? "").collect();
+    expect(sample).not.toBeNull();
+    expect(sample?.maxConnections).toBeGreaterThan(0);
+  });
+});
+
+describe("startup message", () => {
+  it("names the DSN's database, never the password", async () => {
+    let startup: Buffer | null = null;
+    const server = net.createServer((socket) => {
+      socket.once("data", (chunk) => {
+        startup = chunk;
+        socket.destroy();
+      });
+    });
+    servers.push(server);
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resolve(typeof address === "object" && address ? address.port : 0);
+      });
+    });
+    const url = new URL(fixtureDsn(port));
+    url.pathname = "/inventory";
+    url.password = "not-the-database";
+    await new PostgresCollector(url.href).collect();
+    const text = (startup ?? Buffer.alloc(0)).toString("utf8");
+    expect(text).toContain("database\0inventory\0");
+    expect(text).not.toContain("not-the-database");
   });
 });
 

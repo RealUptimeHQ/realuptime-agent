@@ -109,6 +109,18 @@ describe("installers", () => {
     expect(sh).toContain("REA-780");
   });
 
+  // Without the host's root at /host the containerized agent reports its own
+  // container, and the server refuses those metrics for an agent pinned to
+  // "host": a Docker-installed agent then sends no server health at all.
+  it("the Docker install path mounts the host read-only so metrics describe the machine", () => {
+    const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
+    const runLine = sh
+      .split("\n")
+      .find((line) => line.includes("docker run -d --name realuptime-agent"));
+    expect(runLine).toContain("--pid host");
+    expect(runLine).toContain("-v /:/host:ro");
+  });
+
   it("the Windows installer verifies the checksum and runs the agent as LOCAL SERVICE under Task Scheduler", () => {
     const ps = readFileSync(join(HERE, "install", "install-windows.ps1"), "utf8");
     expect(ps).toContain("checksum mismatch");
@@ -149,22 +161,22 @@ describe("installers", () => {
     expect(sh).toContain("no agent-* release found there");
   });
 
-  it("the Linux installer checks Node.js 22+ before any network call on the systemd path", () => {
+  it("the Linux installer's systemd path installs the standalone executable when Node.js 22+ is missing", () => {
     const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
-    // Anchored to install_systemd()'s own body: resolve_agent_tag's usage
-    // pattern is also quoted verbatim in that function's doc comment further
-    // up the file, so a plain indexOf from the top would find the docstring
-    // rather than the real call site.
-    // Anchored with a leading newline: a plain indexOf("install_systemd() {")
-    // finds it as a SUBSTRING of "uninstall_systemd() {" (which is defined
-    // earlier), since "un" + "install_systemd..." contains the same text.
+    // Anchored with a leading newline: "install_systemd() {" is also a
+    // substring of "uninstall_systemd() {", defined earlier.
     const fnIdx = sh.indexOf("\ninstall_systemd() {");
-    expect(fnIdx).toBeGreaterThan(-1);
-    const nodeCheckIdx = sh.indexOf("Node.js 22 or newer is required for the systemd install", fnIdx);
-    const resolveIdx = sh.indexOf('tag="$(resolve_agent_tag)"', fnIdx);
-    expect(nodeCheckIdx).toBeGreaterThan(fnIdx);
-    expect(resolveIdx).toBeGreaterThan(fnIdx);
-    expect(nodeCheckIdx).toBeLessThan(resolveIdx);
+    const fnEnd = sh.indexOf("\n}\n", fnIdx);
+    const body = sh.slice(fnIdx, fnEnd);
+    expect(body).toContain('artifact="realuptime-agent-$version-linux-$arch"');
+    expect(body).toContain('artifact="realuptime-agent-$version.tgz"');
+    expect(body).toContain('exec_start="$INSTALL_DIR/bin/realuptime-agent"');
+    expect(body).toContain("ExecStart=$exec_start");
+    // The executable is verified exactly like the tarball, before install.
+    const verifyIdx = body.indexOf('verify_release "$work/$artifact"');
+    const installIdx = body.indexOf('install -m 0755 "$work/$artifact"');
+    expect(verifyIdx).toBeGreaterThan(-1);
+    expect(installIdx).toBeGreaterThan(verifyIdx);
   });
 
   it("the Linux installer's Docker path names a denied pull plainly, with the systemd fallback, not a bare docker error", () => {
@@ -312,12 +324,12 @@ describe("install.sh picks a method by what can actually be done", () => {
     expect(result.out).toContain("installing the release binary instead");
   });
 
-  it("names both problems when the image cannot be pulled and Node.js 22+ is missing", () => {
+  it("goes on to the standalone executable when the image cannot be pulled and Node.js 22+ is missing", () => {
     const result = run(fakeEnv({ pull: "denied", node: false }));
     expect(result.dockerRan).toBe(false);
-    expect(result.status).not.toBe(0);
     expect(result.out).toContain("could not pull ghcr.io/realuptimehq/agent:latest");
-    expect(result.out).toContain("Node.js 22");
+    expect(result.out).toContain("installing the release binary instead");
+    expect(result.out).not.toContain("there is no way to install the agent here");
   });
 
   it("an explicit --method docker still tries Docker and stops with the explanation", () => {
