@@ -436,9 +436,18 @@ peer authentication over a unix socket), cleartext password, MD5 and
 SCRAM-SHA-256, the Postgres 14+ default. There is no TLS support in this
 version: point the DSN at an
 instance reachable without one, typically `localhost` or the same private
-network the agent already runs on. A DSN that is present but unreachable
-(wrong password, database down) costs that tick's PostgreSQL reading only:
-the OS-level sample is unaffected, and the agent retries next tick.
+network the agent already runs on. For peer authentication over the local
+socket, with no password at all, create a role named after the agent's
+service user and point the DSN at the socket directory:
+
+```
+REALUPTIME_POSTGRES_DSN=postgresql://realuptime-agent@/postgres?host=/var/run/postgresql
+```
+
+A DSN that is present but unreachable (wrong password, database down) costs
+that tick's PostgreSQL reading only: the OS-level sample is unaffected, the
+agent logs the reason once, and it retries next tick. A DSN that does not
+parse is logged once at start, and PostgreSQL metrics stay off.
 
 ### Redis metrics
 

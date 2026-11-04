@@ -78,6 +78,10 @@ export interface PlatformCollector {
  * for tests exactly like `collector` above. */
 export interface PostgresSource {
   collect(): Promise<PostgresSample | null>;
+  /** Whether the DSN parsed; false means Postgres metrics are off. */
+  configured?(): boolean;
+  /** Why the last `collect()` returned null, if it failed. */
+  lastFailure?(): string | null;
 }
 
 /** The subset of `RedisCollector` the metrics collector needs. */
@@ -166,6 +170,12 @@ export class MetricsCollector {
             : null);
     this.postgres =
       options.postgres ?? (options.postgresDsn ? new PostgresCollector(options.postgresDsn) : null);
+    if (this.postgres?.configured && !this.postgres.configured()) {
+      this.warnOnce(
+        "postgres-dsn-unparseable",
+        "REALUPTIME_POSTGRES_DSN could not be parsed, so PostgreSQL metrics are off. Expected postgresql://user:password@host:port/database, or postgresql://user@/database?host=/var/run/postgresql for the local socket.",
+      );
+    }
     this.redis = options.redis ?? (options.redisDsn ? new RedisCollector(options.redisDsn) : null);
     this.mysql = options.mysql ?? (options.mysqlDsn ? new MysqlCollector(options.mysqlDsn) : null);
     this.gpu = options.gpu ?? new NvidiaSmiCollector({ vendor: options.gpuVendor ?? "nvidia" });
@@ -206,6 +216,8 @@ export class MetricsCollector {
       try {
         const pg = await this.postgres.collect();
         if (pg) sample.postgres = pg;
+        const failure = pg ? null : (this.postgres.lastFailure?.() ?? null);
+        if (failure) this.warnOnce("postgres-collect-failed", `PostgreSQL metrics collection failed: ${failure}`);
       } catch (err) {
         // A DSN that is configured but unreachable this tick (wrong
         // password, database restarting, network blip) costs this tick's

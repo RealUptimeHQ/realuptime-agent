@@ -138,7 +138,13 @@ export class LinuxCollector {
     const loadText = this.tryRead(`${roots.proc}/loadavg`);
     const load = loadText ? parseLoadAvg(loadText) : null;
 
-    const mountsText = this.tryRead(`${roots.proc}/mounts`);
+    // `<proc>/mounts` is the READER's mount table. Under the host mount
+    // that is this container's, listing `/host`, `/host/boot` and the
+    // container's own overlays, so it would be statfs'd as `/host/host...`.
+    // PID 1's table is the host's own (`--pid host` / `hostPID`).
+    const mountsText = roots.fs === HOST_MOUNT_ROOT
+      ? (this.tryRead(`${roots.proc}/1/mounts`) ?? this.tryRead(`${roots.proc}/mounts`))
+      : this.tryRead(`${roots.proc}/mounts`);
     const filesystems = mountsText
       ? diskSamplesFromMounts(
           mountsText,

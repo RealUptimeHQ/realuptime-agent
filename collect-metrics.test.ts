@@ -28,6 +28,25 @@ afterEach(() => {
 });
 
 describe("MetricsCollector", () => {
+  it("logs once, at start, when REALUPTIME_POSTGRES_DSN does not parse", () => {
+    new MetricsCollector({ platform: linuxBaseline(), gpu: NO_GPU, postgresDsn: "postgresql://u@[bad/db" });
+    const warned = lines.filter((l) => l.includes("REALUPTIME_POSTGRES_DSN could not be parsed"));
+    expect(warned).toHaveLength(1);
+  });
+
+  it("logs why Postgres collection failed once, then stays quiet", async () => {
+    const platform = linuxBaseline();
+    const postgres = { collect: async () => null, lastFailure: () => "could not connect: connect ENOENT /run/pg" };
+    const collector = new MetricsCollector({ platform, gpu: NO_GPU, postgres });
+    await collector.collect();
+    platform.files.set("/proc/stat", statLine(1200, 8900, 2));
+    await collector.collect();
+    platform.files.set("/proc/stat", statLine(1400, 9800, 2));
+    await collector.collect();
+    const warned = lines.filter((l) => l.includes("PostgreSQL metrics collection failed: could not connect: connect ENOENT"));
+    expect(warned).toHaveLength(1);
+  });
+
   it("returns null on the first call (baseline only) and a real sample on the second", async () => {
     const platform = linuxBaseline();
     const collector = new MetricsCollector({ platform, gpu: NO_GPU });

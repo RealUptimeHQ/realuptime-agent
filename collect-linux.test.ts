@@ -205,6 +205,13 @@ describe("LinuxCollector: the four v2 families, from files only", () => {
       p.exists.add("/.dockerenv"); // this process IS in a container
       p.statfsResults.set(`${HOST_MOUNT_ROOT}/`, { bsize: 4096, blocks: 2000, bfree: 1000 });
       p.files.set(`${HOST_MOUNT_ROOT}/proc/stat`, statLine(5000, 5000, 4));
+      // The reader's own table is the container's, with the host under
+      // /host; the host's real table is PID 1's.
+      p.files.set(`${HOST_MOUNT_ROOT}/proc/1/mounts`, p.files.get("/proc/mounts")!);
+      p.files.set(
+        `${HOST_MOUNT_ROOT}/proc/mounts`,
+        "overlay / overlay rw 0 0\n/dev/sda1 /host ext4 ro 0 0\n/dev/sda15 /host/boot/efi vfat ro 0 0\n",
+      );
       const c = new LinuxCollector(p, warn);
       expect(c.vantage()).toEqual({ vantage: "host", detail: "host-mount" });
       await c.collect([]);

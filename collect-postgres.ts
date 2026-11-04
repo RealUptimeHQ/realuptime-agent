@@ -82,7 +82,11 @@ export interface PostgresConnectOptions {
 export function parsePostgresDsn(raw: string): PostgresConnectOptions | null {
   let url: URL;
   try {
-    url = new URL(raw);
+    // libpq takes `postgresql://user@/db?host=/var/run/postgresql` (a user
+    // and no host, for peer auth over the socket); WHATWG URL refuses
+    // credentials without a host, so give it a placeholder host the `host`
+    // query parameter then overrides.
+    url = new URL(raw.trim().replace(/^(postgres(?:ql)?:\/\/[^/?#]*@)(?=[/?#]|$)/i, "$1localhost"));
   } catch {
     return null;
   }
@@ -92,9 +96,10 @@ export function parsePostgresDsn(raw: string): PostgresConnectOptions | null {
   const portParam = url.searchParams.get("port");
   const port = url.port ? Number(url.port) : portParam ? Number(portParam) : DEFAULT_PORT;
   if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  // libpq also takes the user and database as query parameters.
+  const user = decodeURIComponent(url.username) || url.searchParams.get("user") || "postgres";
   const database =
-    decodeURIComponent(url.pathname.replace(/^\//, "")) || url.username || "postgres";
-  const user = decodeURIComponent(url.username) || "postgres";
+    decodeURIComponent(url.pathname.replace(/^\//, "")) || url.searchParams.get("dbname") || user;
   const password = decodeURIComponent(url.password);
   if (!host) return null;
   return { host, port, user, password, database };
@@ -489,10 +494,12 @@ function toNumber(value: string | null): number | null {
  * one genuinely multi-row result, bounded by its own LIMIT. */
 const QUERY_BATCH = [
   // 1: connections and the oldest still-running query's age, one pass over
-  // pg_stat_activity so the two do not cost two round trips.
+  // pg_stat_activity so the two do not cost two round trips. Only client
+  // backends run queries: a replica's walsender is "active" from the moment
+  // it connects, and would read as a query running for days.
   `select
      count(*) filter (where pid <> pg_backend_pid())::int as connections,
-     coalesce(extract(epoch from max(now() - query_start) filter (where state = 'active' and pid <> pg_backend_pid())), 0)::double precision as longest_query_seconds
+     coalesce(extract(epoch from max(now() - query_start) filter (where state = 'active' and backend_type = 'client backend' and pid <> pg_backend_pid())), 0)::double precision as longest_query_seconds
    from pg_stat_activity`,
   // 2: the configured ceiling connections is measured against.
   `select setting::int as max_connections from pg_settings where name = 'max_connections'`,
@@ -566,6 +573,7 @@ function connectSocket(opts: PostgresConnectOptions): Promise<net.Socket> {
  */
 export class PostgresCollector {
   private readonly opts: PostgresConnectOptions | null;
+  private failure: string | null = null;
 
   constructor(dsn: string) {
     this.opts = parsePostgresDsn(dsn);
@@ -578,13 +586,20 @@ export class PostgresCollector {
     return this.opts !== null;
   }
 
+  /** Why the last `collect()` returned null, for the caller's one log
+   * line: a connection or authentication error, never the password. */
+  lastFailure(): string | null {
+    return this.failure;
+  }
+
   async collect(): Promise<PostgresSample | null> {
     if (!this.opts) return null;
     const opts = this.opts;
     let socket: net.Socket;
     try {
       socket = await withTimeout(connectSocket(opts), CONNECT_TIMEOUT_MS, "postgres connect");
-    } catch {
+    } catch (err) {
+      this.failure = `could not connect: ${errorMessage(err)}`;
       return null;
     }
     try {
@@ -600,11 +615,17 @@ export class PostgresCollector {
         QUERY_TIMEOUT_MS,
         "postgres query",
       );
+      this.failure = null;
       return buildSample(results);
-    } catch {
+    } catch (err) {
+      this.failure = errorMessage(err);
       return null;
     } finally {
       socket.destroy();
     }
   }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

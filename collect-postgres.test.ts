@@ -47,6 +47,24 @@ describe("parsePostgresDsn", () => {
     });
   });
 
+  it("reads libpq's user-and-socket form used for peer auth", () => {
+    expect(parsePostgresDsn("postgresql://realuptime-agent@/postgres?host=/var/run/postgresql")).toEqual({
+      host: "/var/run/postgresql",
+      port: 5432,
+      user: "realuptime-agent",
+      password: "",
+      database: "postgres",
+    });
+  });
+
+  it("takes the user and database from libpq's query parameters", () => {
+    expect(parsePostgresDsn("postgresql:///?host=/run/postgresql&user=monitor&dbname=appdb")).toMatchObject({
+      host: "/run/postgresql",
+      user: "monitor",
+      database: "appdb",
+    });
+  });
+
   it("returns null for an unparseable or wrong-scheme DSN", () => {
     expect(parsePostgresDsn("not a url")).toBeNull();
     expect(parsePostgresDsn("mysql://u:p@localhost/db")).toBeNull();
@@ -275,6 +293,7 @@ describe("PostgresCollector", () => {
   it("returns null when nothing is listening on the port (connection refused)", async () => {
     const collector = new PostgresCollector("postgresql://monitor:x@127.0.0.1:1/appdb");
     expect(await collector.collect()).toBeNull();
+    expect(collector.lastFailure()).toMatch(/^could not connect: .*ECONNREFUSED/);
   });
 
   it("refuses a SASL offer with no supported mechanism with a null result, not a hang", async () => {
