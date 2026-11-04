@@ -1,4 +1,4 @@
-import { AuthError, VantageConflictError, type AgentApi } from "./api.ts";
+import { AuthError, TransientError, VantageConflictError, type AgentApi } from "./api.ts";
 import {
   capAssignedChecks,
   DEFAULT_BOUNDS,
@@ -468,6 +468,18 @@ export class AgentRuntime {
         log("error", "agent metrics vantage rejected by server", {
           error: err.message,
           hint: "register a new agent token for this vantage; check results are unaffected",
+        });
+        return;
+      }
+      if (err instanceof TransientError && err.status === 413) {
+        // The server will refuse this exact batch every time, so retrying it
+        // would stop metrics for the life of the process. Drop it, say so,
+        // and carry on with the next one.
+        this.metricsBuffer.commit(batch.length);
+        this.nextMetricsFlushAt = now + FLUSH_INTERVAL_MS;
+        log("error", "metrics batch refused as too large, dropped", {
+          dropped: batch.length,
+          buffered: this.metricsBuffer.size,
         });
         return;
       }

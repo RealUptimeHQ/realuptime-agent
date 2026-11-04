@@ -152,7 +152,10 @@ function Install-RealUptimeAgent {
   if ($Url) { $envMap.REALUPTIME_URL = $Url }
   if ($Cluster) { $envMap.REALUPTIME_CLUSTER = $Cluster }
   if ($Node) { $envMap.REALUPTIME_NODE = $Node }
-  $envMap | ConvertTo-Json -Compress | Set-Content -Path $envFile -Encoding UTF8
+  # The file is created empty and locked down BEFORE the token is written,
+  # so the token never sits under the install directory's inherited ACL
+  # (readable by every local user), not even for an instant.
+  Set-Content -Path $envFile -Value "" -Encoding UTF8
   $acl = Get-Acl $envFile
   $acl.SetAccessRuleProtection($true, $false)
   foreach ($who in @("BUILTIN\Administrators", "NT AUTHORITY\LOCAL SERVICE", "NT AUTHORITY\SYSTEM")) {
@@ -160,6 +163,7 @@ function Install-RealUptimeAgent {
   }
   $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", "Allow")))
   Set-Acl $envFile $acl
+  $envMap | ConvertTo-Json -Compress | Set-Content -Path $envFile -Encoding UTF8
 
   # A tiny launcher that loads env.json into the environment and execs the
   # agent. Kept as a file in the install dir so the task's command line

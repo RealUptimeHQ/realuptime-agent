@@ -37,7 +37,11 @@ import type { PostgresSample } from "./types.ts";
  * ## Authentication
  *
  * Trust (including peer auth over a unix socket), cleartext password, MD5
- * and SCRAM-SHA-256 are supported. SCRAM-SHA-256 is the default
+ * and SCRAM-SHA-256 are supported, with cleartext answered only over a unix
+ * socket or loopback (`cleartextPasswordAllowed`). The server, not the
+ * client, picks the method, and there is no TLS here, so anything on the
+ * path to a remote instance could otherwise ask for the password in the
+ * clear and read it off the wire. SCRAM-SHA-256 is the default
  * `password_encryption` and `pg_hba.conf` method since Postgres 14, so a
  * monitoring role created the ordinary way on any current server uses it.
  * It is implemented per RFC 5802 / RFC 7677 without channel binding (the
@@ -111,6 +115,20 @@ export function dsnFingerprint(opts: PostgresConnectOptions): string {
   return `${opts.user}@${opts.host}:${opts.port}/${opts.database}`;
 }
 
+/** The highest SCRAM iteration count this agent will compute (Postgres's
+ * default is 4096; `scram_iterations` is settable since Postgres 16). */
+export const MAX_SCRAM_ITERATIONS = 1_000_000;
+
+/** Whether the password may be sent in the clear to this host: only when
+ * the bytes never leave the machine (a unix socket path, or loopback). */
+export function cleartextPasswordAllowed(host: string): boolean {
+  if (host.startsWith("/")) return true;
+  const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+  if (bare === "localhost" || bare === "::1") return true;
+  if (net.isIPv4(bare)) return bare.startsWith("127.");
+  return /^::ffff:127\./.test(bare);
+}
+
 function md5Hex(input: Buffer | string): string {
   return createHash("md5").update(input).digest("hex");
 }
@@ -159,6 +177,11 @@ export function scramClientFinal(
   const iterations = Number(attrs.get("i"));
   if (!nonce || !salt || !Number.isInteger(iterations) || iterations < 1) {
     throw new Error("malformed SCRAM server-first message");
+  }
+  // pbkdf2Sync blocks the whole agent for as long as the server's count
+  // says. Postgres defaults to 4096; a count past this is refused.
+  if (iterations > MAX_SCRAM_ITERATIONS) {
+    throw new Error(`SCRAM iteration count ${iterations} is over this agent's limit of ${MAX_SCRAM_ITERATIONS}`);
   }
   if (!nonce.startsWith(client.clientNonce)) {
     throw new Error("SCRAM server nonce does not extend the client nonce");
@@ -337,8 +360,9 @@ async function authenticate(
   socket: net.Socket,
   user: string,
   password: string,
+  host: string,
 ): Promise<void> {
-  let scram: { client: ScramClient; expectedServerSignature: string | null } | null = null;
+  let scram: { client: ScramClient; expectedServerSignature: string | null; verified: boolean } | null = null;
   for (;;) {
     const msg = await reader.next();
     if (msg.type === "E") {
@@ -350,12 +374,17 @@ async function authenticate(
       if (authType === 0) {
         // AuthenticationOk; keep reading to ReadyForQuery. A SCRAM exchange
         // must have ended in a verified server signature first.
-        if (scram && scram.expectedServerSignature !== null) {
+        if (scram && !scram.verified) {
           throw new Error("postgres accepted SCRAM authentication without proving the password");
         }
         continue;
       }
       if (authType === 3) {
+        if (!cleartextPasswordAllowed(host)) {
+          throw new Error(
+            "postgres asked for the password in cleartext over the network; this agent sends a cleartext password only over a unix socket or loopback (use scram-sha-256 in pg_hba.conf)",
+          );
+        }
         socket.write(buildPasswordMessage(password));
         continue;
       }
@@ -373,7 +402,7 @@ async function authenticate(
           );
         }
         const first = scramClientFirst();
-        scram = { client: first.client, expectedServerSignature: null };
+        scram = { client: first.client, expectedServerSignature: null, verified: false };
         socket.write(buildSaslInitialResponse(SCRAM_MECHANISM, first.message));
         continue;
       }
@@ -392,7 +421,7 @@ async function authenticate(
         if (!scramServerFinalValid(msg.payload.toString("utf8", 4), scram.expectedServerSignature)) {
           throw new Error("postgres SCRAM server signature did not verify");
         }
-        scram.expectedServerSignature = null;
+        scram.verified = true;
         continue;
       }
       throw new Error(
@@ -606,7 +635,7 @@ export class PostgresCollector {
       const reader = new PgMessageReader(socket);
       socket.write(buildStartupMessage(opts.user, opts.database));
       await withTimeout(
-        authenticate(reader, socket, opts.user, opts.password),
+        authenticate(reader, socket, opts.user, opts.password, opts.host),
         CONNECT_TIMEOUT_MS,
         "postgres authentication",
       );

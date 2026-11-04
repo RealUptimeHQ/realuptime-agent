@@ -666,6 +666,24 @@ describe("AgentRuntime metrics", () => {
     expect(api.sent.length).toBeGreaterThan(0);
   });
 
+  it("drops a batch the server refuses as too large (413) instead of retrying it forever", async () => {
+    const api = new FakeApi();
+    api.sendMetricsError = new TransientError("/api/agent/v1/metrics returned 413", 413);
+    const metricsSource = new FakeMetricsSource();
+    metricsSource.nextSample = metricSample(0);
+    const h = harness(api, new ResultBuffer(), metricsSource);
+
+    await h.tickAt(0);
+    expect(h.metricsBuffer.size).toBe(0);
+    expect(lines.some((l) => l.includes("refused as too large"))).toBe(true);
+
+    // The next batch goes out normally.
+    api.sendMetricsError = null;
+    metricsSource.nextSample = metricSample(METRICS_SAMPLE_INTERVAL_MS);
+    for (let t = METRICS_SAMPLE_INTERVAL_MS; t <= 2 * METRICS_SAMPLE_INTERVAL_MS; t += 15_000) await h.tickAt(t);
+    expect(api.metricsSent.length).toBeGreaterThan(0);
+  });
+
   it("drops the oldest samples once the metrics buffer overflows, and counts them", async () => {
     const api = new FakeApi();
     api.sendMetricsError = new TransientError("offline");

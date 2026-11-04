@@ -9,6 +9,7 @@ describe("parseRedisDsn", () => {
       port: 6380,
       password: "secret",
       db: 2,
+      tls: false,
     });
   });
 
@@ -18,11 +19,16 @@ describe("parseRedisDsn", () => {
       port: 6379,
       password: null,
       db: null,
+      tls: false,
     });
   });
 
-  it("accepts the rediss:// alias", () => {
-    expect(parseRedisDsn("rediss://localhost")?.host).toBe("localhost");
+  it("reads rediss:// as TLS", () => {
+    expect(parseRedisDsn("rediss://localhost")).toMatchObject({ host: "localhost", tls: true });
+  });
+
+  it("refuses rediss:// on a unix socket, which has no TLS to give", () => {
+    expect(parseRedisDsn("rediss://?path=/var/run/redis/redis.sock")).toBeNull();
   });
 
   it("reads a unix-socket DSN from the path query parameter", () => {
@@ -31,6 +37,7 @@ describe("parseRedisDsn", () => {
       port: 6379,
       password: "x",
       db: null,
+      tls: false,
     });
   });
 
@@ -156,6 +163,33 @@ describe("RedisCollector", () => {
     const collector = new RedisCollector(`redis://127.0.0.1:${port}`);
     const sample = await collector.collect();
     expect(sample?.maxMemoryBytes).toBe(536870912);
+  });
+
+  it("never sends the password in the clear on a rediss:// DSN", async () => {
+    // A plaintext server on the far end of a TLS DSN is what anything on the
+    // path looks like. The TLS handshake fails, so AUTH is never written.
+    let received = "";
+    const server = net.createServer((socket) => {
+      socket.on("data", (chunk) => {
+        received += chunk.toString("latin1");
+        socket.write(simpleString("OK"));
+      });
+    });
+    servers.push(server);
+    const port = await new Promise<number>((resolve) =>
+      server.listen(0, "127.0.0.1", () => resolve((server.address() as net.AddressInfo).port)),
+    );
+    const collector = new RedisCollector(`rediss://:very-secret@127.0.0.1:${port}`);
+    expect(await collector.collect()).toBeNull();
+    expect(received).not.toContain("very-secret");
+    expect(received).not.toContain("AUTH");
+  });
+
+  it("returns null on a non-numeric bulk length instead of spinning forever", async () => {
+    // `$abc` used to parse as a zero-byte reply that consumed nothing, so the
+    // reader looped on the same bytes without ever yielding: a hung agent.
+    const port = await startFakeServer([Buffer.from("$abc\r\n", "latin1")]);
+    expect(await new RedisCollector(`redis://127.0.0.1:${port}`).collect()).toBeNull();
   });
 
   it("returns null (not a throw) on an AUTH error", async () => {

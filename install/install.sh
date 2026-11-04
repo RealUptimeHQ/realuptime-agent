@@ -16,7 +16,7 @@
 # `sha256sum install.sh`), so a change here without regenerating that
 # checksum fails the suite rather than shipping a script whose published
 # hash no longer matches what `curl | sh` actually fetches.
-INSTALLER_SCRIPT_VERSION="5"
+INSTALLER_SCRIPT_VERSION="7"
 #
 # What it does, in order, and nothing else:
 #   1. Picks a method by what can actually be done on this host. On macOS
@@ -35,17 +35,16 @@ INSTALLER_SCRIPT_VERSION="5"
 #      repository is private, so an anonymous request gets a bare 404
 #      instead of a redirect, and even a working redirect there could land
 #      on a release for a different product). Downloads that release's
-#      tarball and its SHA256SUMS from the release URL, verifies the
-#      checksum, and (when cosign is installed) verifies the detached
-#      signature against the public key served at
-#      https://realuptime.io/.well-known/cosign.pub. A checksum or
-#      signature mismatch aborts before anything is unpacked.
+#      tarball, its SHA256SUMS and SHA256SUMS.sig from the release URL,
+#      verifies the signature on SHA256SUMS against the release key pinned
+#      below (with openssl, or cosign when openssl is absent), then the
+#      checksum. A release without a signature, a signature that does not
+#      verify, a machine with neither openssl nor cosign, or a checksum
+#      mismatch all abort before anything is unpacked.
 #      Docker path: when cosign is installed, verifies the image's cosign
-#      signature against the same public key before running it; when cosign
-#      is absent, says so and runs the image unverified, exactly the way the
-#      systemd path always has for a missing cosign binary. Either way this
-#      is a courtesy check, never a hard gate: an unverifiable image still
-#      runs, the same as an unsigned one always has. A pull the registry
+#      signature against the same key and refuses an image that fails it;
+#      without cosign there is no way to check an image signature, so it
+#      says so and runs the image. A pull the registry
 #      denies (no read access for this host, or a stale `docker login`) fails
 #      with a message naming exactly that and how to fall back to
 #      --method systemd, not a bare docker error (REA-601).
@@ -83,7 +82,15 @@ set -eu
 MIRROR_REPO="realuptimehq/realuptime-agent"
 RELEASE_BASE="${REALUPTIME_RELEASE_BASE:-https://github.com/${MIRROR_REPO}/releases/download}"
 MIRROR_API_BASE="${REALUPTIME_AGENT_API_BASE:-https://api.github.com/repos/${MIRROR_REPO}}"
-COSIGN_KEY_URL="https://realuptime.io/.well-known/cosign.pub"
+# The release signing key, pinned in this file so a compromised download
+# host cannot swap it: the cosign key served at
+# https://realuptime.io/.well-known/cosign.pub (install.test.ts pins the two
+# equal). REALUPTIME_RELEASE_PUBKEY names another key file, for a mirror
+# that signs its own builds.
+RELEASE_PUBKEY_PEM="-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEyZyJRubqmzj2g+Wwh8YTcs6OdDAK
+rqI0MPmZgwKVNltl/1zGxIcEXhOg30ut03v2jLQklMpUJbFk6BkA8RsYmg==
+-----END PUBLIC KEY-----"
 IMAGE="ghcr.io/realuptimehq/agent:latest"
 OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
 INSTALL_DIR="/opt/realuptime-agent"
@@ -238,18 +245,33 @@ env_lines() {
   return 0
 }
 
+# Writes the release key into directory $1 and prints its path.
+release_pubkey() {
+  if [ -n "${REALUPTIME_RELEASE_PUBKEY:-}" ]; then
+    printf '%s\n' "$REALUPTIME_RELEASE_PUBKEY"
+    return
+  fi
+  printf '%s\n' "$RELEASE_PUBKEY_PEM" > "$1/release.pub"
+  printf '%s\n' "$1/release.pub"
+}
+
 verify_image() {
-  # $1 = image reference. Mirrors verify_release's behavior for the tarball
-  # path: verify when cosign is present, log honestly and proceed when it
-  # isn't. Never blocks the install either way -- an unsigned or unverifiable
-  # image still runs, same as a missing cosign binary never blocked the
-  # tarball path before signatures existed. This function only ever informs;
-  # docker itself pulls and runs the image below regardless of what it finds.
+  # $1 = image reference. An image whose signature cosign cannot verify is
+  # refused. Without cosign, or with a cosign too old to read the signature
+  # format, nothing here can check it, so those cases say so and go on.
   if command -v cosign >/dev/null 2>&1; then
-    if cosign verify --key "$COSIGN_KEY_URL" "$1" >/dev/null 2>&1; then
+    keydir="$(mktemp -d)"
+    key="$(release_pubkey "$keydir")"
+    if cosign verify --key "$key" "$1" >/dev/null 2>&1; then
+      rm -rf "$keydir"
       say "verified image signature with cosign ($1)"
+    elif cosign version 2>&1 | grep -Eq 'GitVersion:[[:space:]]+v[0-2][.]'; then
+      # Images are signed as sigstore bundles, which cosign reads from 3.0.
+      rm -rf "$keydir"
+      say "this cosign is older than 3.0 and cannot read the signature on $1: running it unverified (cosign 3 or newer verifies it)"
     else
-      say "warning: cosign could not verify the signature on $1 (continuing; the image still runs)"
+      rm -rf "$keydir"
+      die "cosign could not verify the signature on $1: refusing to run it. Install with --method systemd to use the signed release instead."
     fi
   else
     say "cosign not found: skipping image signature verification (install cosign to verify $1 before it runs)"
@@ -281,7 +303,11 @@ install_docker() {
   # already pinned to "host". With /host/proc/stat present the collector
   # reads the machine's /proc, /sys and filesystems (collect-linux.ts), the
   # same mount the Kubernetes DaemonSet uses.
-  if run_out="$(docker run -d --name realuptime-agent --restart unless-stopped --network host --pid host -v /:/host:ro --env-file "$tmp" "$IMAGE" 2>&1)"; then
+  # --cap-drop ALL, no-new-privileges and a read-only root: the same
+  # boundary the Kubernetes DaemonSet sets. The image already runs as the
+  # unprivileged `node` user and writes nothing, so these cost the agent
+  # nothing and leave a compromised process no capability to regain.
+  if run_out="$(docker run -d --name realuptime-agent --restart unless-stopped --network host --pid host -v /:/host:ro --cap-drop ALL --security-opt no-new-privileges:true --read-only --env-file "$tmp" "$IMAGE" 2>&1)"; then
     rm -f "$tmp"
   else
     rm -f "$tmp"
@@ -313,19 +339,35 @@ sha256_of() {
   fi
 }
 
+# Checks SHA256SUMS against its signature: cosign's detached signature, an
+# ECDSA P-256 signature over the file's SHA-256, base64 encoded, which
+# openssl verifies as well as cosign does. Fails closed.
+verify_signature() {
+  # $1 = sums path, $2 = signature path, $3 = directory for scratch files
+  [ -s "$2" ] || die "this release has no SHA256SUMS.sig: refusing to install an unsigned release"
+  key="$(release_pubkey "$3")"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl base64 -d -A -in "$2" -out "$3/SHA256SUMS.sig.der" 2>/dev/null \
+      && openssl dgst -sha256 -verify "$key" -signature "$3/SHA256SUMS.sig.der" "$1" >/dev/null 2>&1 \
+      || die "the signature on SHA256SUMS did not verify: refusing to install"
+    say "verified release signature"
+  elif command -v cosign >/dev/null 2>&1; then
+    cosign verify-blob --key "$key" --signature "$2" --insecure-ignore-tlog=true "$1" >/dev/null 2>&1 \
+      || die "the signature on SHA256SUMS did not verify: refusing to install"
+    say "verified release signature with cosign"
+  else
+    die "neither openssl nor cosign is installed, so the release signature cannot be checked: install openssl and run this again"
+  fi
+}
+
 verify_release() {
-  # $1 = tarball path, $2 = sums path, $3 = signature path (may be absent)
+  # $1 = tarball path, $2 = sums path, $3 = signature path
+  verify_signature "$2" "$3" "$(dirname "$2")"
   expected="$(grep " $(basename "$1")\$" "$2" | awk '{print $1}')"
   [ -n "$expected" ] || die "SHA256SUMS does not list $(basename "$1")"
   actual="$(sha256_of "$1")"
   [ "$expected" = "$actual" ] || die "checksum mismatch for $(basename "$1"): refusing to install"
-  if command -v cosign >/dev/null 2>&1 && [ -s "$3" ]; then
-    cosign verify-blob --key "$COSIGN_KEY_URL" --signature "$3" "$2" >/dev/null 2>&1 \
-      || die "cosign signature on SHA256SUMS did not verify: refusing to install"
-    say "verified release signature with cosign"
-  else
-    say "verified SHA256 checksum (install cosign to also verify the release signature)"
-  fi
+  say "verified SHA256 checksum"
 }
 
 # The standalone executable's architecture suffix for this machine, or

@@ -1,4 +1,5 @@
 import * as net from "node:net";
+import * as tls from "node:tls";
 import type { RedisSample } from "./types.ts";
 
 /**
@@ -27,19 +28,25 @@ const DEFAULT_PORT = 6379;
 const CONNECT_TIMEOUT_MS = 3000;
 const COMMAND_TIMEOUT_MS = 5000;
 const CRLF = "\r\n";
+/** An INFO reply is around ten kilobytes; nothing this module reads is near
+ * this. A reply past it is refused, not buffered. */
+const MAX_REPLY_BYTES = 1024 * 1024;
 
 export interface RedisConnectOptions {
   /** A hostname/IP for TCP, or a full socket path (starts with "/"). */
   host: string;
   port: number;
   password: string | null;
+  /** `rediss://`: TLS with the certificate verified against `host`. */
+  tls: boolean;
   /** Absent means db 0, RESP's default. */
   db: number | null;
 }
 
-/** Accepts `redis://[:password@]host:port[/db]` (and the `rediss://` alias,
- * treated identically -- TLS is not implemented in this phase, see the
- * module doc), and a unix-socket form via a `path` query parameter:
+/** Accepts `redis://[:password@]host:port[/db]` (and `rediss://`, the same
+ * over TLS with the server certificate verified, so a DSN that asks for TLS
+ * never sends its password in the clear), and a unix-socket form via a
+ * `path` query parameter:
  * `redis://?path=/var/run/redis/redis.sock&password=...`. Returns null for
  * anything unparseable. */
 export function parseRedisDsn(raw: string): RedisConnectOptions | null {
@@ -64,7 +71,9 @@ export function parseRedisDsn(raw: string): RedisConnectOptions | null {
     db = parsed;
   }
   if (!host) return null;
-  return { host, port, password, db };
+  const useTls = url.protocol === "rediss:";
+  if (useTls && host.startsWith("/")) return null;
+  return { host, port, password, db, tls: useTls };
 }
 
 export function dsnFingerprint(opts: RedisConnectOptions): string {
@@ -97,7 +106,13 @@ function tryParseReply(buffer: Buffer): { value: RespValue; consumed: number } |
   if (type === ":") return { value: { kind: "integer", text: line }, consumed: lineEnd + 2 };
   if (type === "$") {
     const len = Number(line);
-    if (len < 0) return { value: { kind: "bulk", text: null }, consumed: lineEnd + 2 };
+    if (len === -1) return { value: { kind: "bulk", text: null }, consumed: lineEnd + 2 };
+    // Anything but a sane length is a protocol error, never a parse: a
+    // non-numeric length would otherwise consume nothing and spin drain()
+    // forever, and a huge one would have the reader hold that much.
+    if (!Number.isInteger(len) || len < 0 || len > MAX_REPLY_BYTES) {
+      throw new Error("malformed RESP bulk length");
+    }
     const start = lineEnd + 2;
     const end = start + len;
     if (buffer.length < end + 2) return null;
@@ -124,6 +139,12 @@ class RespReader {
   constructor(socket: net.Socket) {
     socket.on("data", (chunk: Buffer) => {
       this.buffer = Buffer.concat([this.buffer, chunk]);
+      if (this.buffer.length > MAX_REPLY_BYTES + 64) {
+        this.error = new Error("redis reply too large");
+        socket.destroy();
+        this.signal();
+        return;
+      }
       this.drain();
     });
     socket.on("error", (err) => {
@@ -198,16 +219,24 @@ async function command(
 
 function connectSocket(opts: RedisConnectOptions): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
-    const socket = opts.host.startsWith("/")
+    const socket: net.Socket = opts.host.startsWith("/")
       ? net.createConnection({ path: opts.host })
-      : net.createConnection({ host: opts.host, port: opts.port });
+      : opts.tls
+        ? tls.connect({
+            host: opts.host,
+            port: opts.port,
+            servername: net.isIP(opts.host) ? undefined : opts.host,
+          })
+        : net.createConnection({ host: opts.host, port: opts.port });
     const onError = (err: Error) => {
       socket.destroy();
       reject(err);
     };
     socket.once("error", onError);
     const onIdle = () => onError(new Error("redis connection timed out"));
-    socket.once("connect", () => {
+    // Over TLS the socket is usable once the handshake (and the certificate
+    // check) has passed, not at the TCP connect.
+    socket.once(opts.tls ? "secureConnect" : "connect", () => {
       socket.off("error", onError);
       // The idle timer bounds the connect only; left armed it would destroy
       // the socket mid-read (same fix as collect-postgres.ts).

@@ -1,4 +1,5 @@
 import type { EgressGuard } from "./egress-guard.ts";
+import { createPinnedFetch } from "./pinned-fetch.ts";
 import {
   evaluateHttpAssertions,
   hasHttpAssertions,
@@ -25,7 +26,10 @@ import {
  * (`docs/private-probe-locations.md` section 3.3). It arrives here as the
  * optional `egress` argument and is consulted on the first request AND on
  * every redirect hop, because a redirect is a dial at an address the first
- * verdict never saw.
+ * verdict never saw. A hop that carries a credential is judged with the
+ * public-address rule enforced in every mode and is pinned to the approved
+ * addresses, so a check URL the server chose can never carry this machine's
+ * secret to the internet, by name or by rebinding.
  *
  * Everything else the fleet probe does for its own safety was already here and
  * was never about SSRF:
@@ -128,29 +132,37 @@ export async function runHttpCheck(
       };
     }
 
+    // The credential rides this hop only to the origin it was configured
+    // for, which is the rule browsers and curl follow too.
+    const sendCredential = authHeaders != null && credentialOrigin !== null && target.origin === credentialOrigin;
+    let dial = fetchImpl;
     if (egress) {
       // Per hop, never once per check. A hostname that resolves privately on
       // the first dial and publicly on the second is exactly the DNS-rebinding
       // shape this has to catch, and a redirect is the cheapest way to reach a
       // second host entirely.
-      const decision = await egress(target.hostname, portFor(target));
+      const decision = await egress(target.hostname, portFor(target), { credentialed: sendCredential });
       if (!decision.proceed) {
         return { ok: false, latencyMs: Date.now() - started, error: decision.error };
       }
+      // A credentialed hop is pinned to the addresses the guard just
+      // approved (pinned-fetch.ts), so the name cannot be re-resolved
+      // somewhere else between the verdict and the dial. A caller-supplied
+      // fetchImpl is a test seam and is used as given.
+      if (sendCredential && fetchImpl === fetch) dial = createPinnedFetch(decision.addresses);
     }
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), remaining);
     let res: Response;
     try {
-      res = await fetchImpl(target.toString(), {
+      res = await dial(target.toString(), {
         method: "GET",
         redirect: "manual",
         signal: controller.signal,
-        headers:
-          authHeaders && credentialOrigin !== null && target.origin === credentialOrigin
-            ? { ...authHeaders, "user-agent": "RealUptime-Monitor-Agent" }
-            : { "user-agent": "RealUptime-Monitor-Agent" },
+        headers: sendCredential
+          ? { ...authHeaders, "user-agent": "RealUptime-Monitor-Agent" }
+          : { "user-agent": "RealUptime-Monitor-Agent" },
       });
     } catch (err) {
       const latencyMs = Date.now() - started;

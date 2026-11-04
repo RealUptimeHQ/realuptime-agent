@@ -35,6 +35,12 @@ import type {
 
 export const REQUEST_TIMEOUT_MS = 20_000;
 
+/** The most this program reads of any response from RealUptime. A full poll
+ * (the per-agent check ceiling, each check with its auth block) is tens of
+ * kilobytes; a body past this is a broken or hostile server, and reading it
+ * whole would let that server exhaust the memory of the customer's machine. */
+export const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
+
 export class AuthError extends Error {
   constructor(message = "The agent token was rejected") {
     super(message);
@@ -177,7 +183,7 @@ export class ApiClient implements AgentApi {
       throw new AuthError();
     }
     if (res.status === 409 && opts.on409) {
-      const body = await res.json().catch(() => undefined);
+      const body = await readJson(res).catch(() => undefined);
       opts.on409(body);
     }
     if (!res.ok) {
@@ -186,13 +192,37 @@ export class ApiClient implements AgentApi {
     }
 
     try {
-      return await res.json();
+      return await readJson(res);
     } catch (err) {
       // A 200 with an unparseable body is a broken deployment on our side, not
       // on the customer's. Transient, so the agent keeps its data and waits.
       throw new TransientError(`${path} returned an unreadable body: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
+}
+
+/** The body as JSON, read up to `MAX_RESPONSE_BYTES` and no further. */
+async function readJson(res: Response): Promise<unknown> {
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    void res.body?.cancel().catch(() => {});
+    throw new Error(`body of ${declared} bytes is over the ${MAX_RESPONSE_BYTES} byte limit`);
+  }
+  if (!res.body) return JSON.parse("");
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_RESPONSE_BYTES) {
+      void reader.cancel().catch(() => {});
+      throw new Error(`body is over the ${MAX_RESPONSE_BYTES} byte limit`);
+    }
+    chunks.push(value);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
 /**

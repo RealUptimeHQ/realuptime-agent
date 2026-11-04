@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   MAX_POSTGRES_DATABASES_PER_SAMPLE,
   PostgresCollector,
+  cleartextPasswordAllowed,
   dsnFingerprint,
   md5PasswordResponse,
   scramClientFinal,
@@ -380,6 +381,52 @@ describe("PostgresCollector", () => {
   });
 });
 
+describe("authentication downgrades", () => {
+  it("rejects AuthenticationOk sent before the SCRAM exchange has even started", async () => {
+    // Anything on the path can answer the SASL offer with a bare
+    // AuthenticationOk. The client then has no server signature to check, so
+    // it must refuse rather than treat "nothing to check" as "checked".
+    const port = await startFakeServer(
+      (socket) => socket.write(minimalBatch()),
+      (socket, done) => {
+        socket.write(frame("R", saslBody(10, "SCRAM-SHA-256\0\0")));
+        socket.once("data", () => {
+          socket.write(Buffer.concat([authOk(), readyForQuery()]));
+          done();
+        });
+      },
+    );
+    expect(await new PostgresCollector(fixtureDsn(port)).collect()).toBeNull();
+  });
+
+  it("still answers a cleartext request over loopback", async () => {
+    let received = "";
+    const port = await startFakeServer(
+      (socket) => socket.write(minimalBatch()),
+      (socket, done) => {
+        socket.write(frame("R", saslBody(3, "")));
+        socket.once("data", (chunk) => {
+          received = chunk.toString("utf8", 5, chunk.length - 1);
+          socket.write(Buffer.concat([authOk(), readyForQuery()]));
+          done();
+        });
+      },
+    );
+    expect(await new PostgresCollector(fixtureDsn(port)).collect()).not.toBeNull();
+    expect(received).toBe(FIXTURE_PASSWORD);
+  });
+
+  it("sends a cleartext password only where the bytes never leave the machine", () => {
+    expect(cleartextPasswordAllowed("/var/run/postgresql")).toBe(true);
+    expect(cleartextPasswordAllowed("localhost")).toBe(true);
+    expect(cleartextPasswordAllowed("127.0.0.1")).toBe(true);
+    expect(cleartextPasswordAllowed("[::1]")).toBe(true);
+    expect(cleartextPasswordAllowed("10.0.0.5")).toBe(false);
+    expect(cleartextPasswordAllowed("db.internal")).toBe(false);
+    expect(cleartextPasswordAllowed("[2001:db8::5]")).toBe(false);
+  });
+});
+
 const FIXTURE_PASSWORD = "x";
 
 /** A loopback DSN for the fake server, with a placeholder password. */
@@ -468,6 +515,14 @@ describe("SCRAM-SHA-256 client", () => {
       true,
     );
     expect(scramServerFinalValid("v=AAAA", final.expectedServerSignature)).toBe(false);
+  });
+
+  it("refuses an iteration count that would block the agent", () => {
+    const { client } = scramClientFirst();
+    const salt = Buffer.from("s").toString("base64");
+    expect(() => scramClientFinal(client, "x", `r=${client.clientNonce}y,s=${salt},i=5000000`)).toThrow(
+      /iteration count/,
+    );
   });
 
   it("refuses a server nonce that does not extend the client's", () => {

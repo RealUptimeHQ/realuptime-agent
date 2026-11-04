@@ -251,3 +251,83 @@ describe("runHttpCheck: the egress guard", () => {
     expect((await runHttpCheck(url)).ok).toBe(true);
   });
 });
+
+describe("runHttpCheck: a hop that carries a credential", () => {
+  const AUTH = { authorization: "Bearer resolved-on-this-machine" };
+
+  it("tells the guard which hops carry the credential", async () => {
+    const final = await serve((_req, res) => res.writeHead(200).end());
+    const start = await serve((_req, res) => res.writeHead(302, { location: final }).end());
+    const asked: (boolean | undefined)[] = [];
+    const out = await runHttpCheck(
+      start,
+      undefined,
+      undefined,
+      undefined,
+      async (_host, _port, options) => {
+        asked.push(options?.credentialed);
+        return { proceed: true, addresses: [{ address: "127.0.0.1", family: 4 }] };
+      },
+      AUTH,
+    );
+    expect(out.ok).toBe(true);
+    // The first hop carries it; the cross-origin redirect hop does not.
+    expect(asked).toEqual([true, false]);
+  });
+
+  it("dials the address the guard approved, never a fresh resolution of the name", async () => {
+    // `rebind.invalid` can never resolve (RFC 6761), so the request only
+    // arrives if the socket is pinned to the guard's answer. An unpinned
+    // fetch resolves the name itself, which is exactly the window a
+    // rebinding record uses to send the credential somewhere else.
+    let seen: string | undefined;
+    const url = await serve((req, res) => {
+      seen = req.headers.authorization;
+      res.writeHead(200).end();
+    });
+    const port = new URL(url).port;
+    const out = await runHttpCheck(
+      `http://rebind.invalid:${port}/health`,
+      2_000,
+      undefined,
+      undefined,
+      async () => ({ proceed: true, addresses: [{ address: "127.0.0.1", family: 4 }] }),
+      AUTH,
+    );
+    expect(out.ok).toBe(true);
+    expect(seen).toBe(AUTH.authorization);
+  });
+
+  it("decodes a compressed body the way fetch does, for assertions", async () => {
+    const { gzipSync } = await import("node:zlib");
+    const url = await serve((_req, res) => {
+      res.writeHead(200, { "content-encoding": "gzip" }).end(gzipSync("status: healthy"));
+    });
+    const port = new URL(url).port;
+    const out = await runHttpCheck(
+      `http://pinned.invalid:${port}/`,
+      2_000,
+      undefined,
+      { assertionBodyOp: "contains", assertionBodyValue: "healthy" },
+      async () => ({ proceed: true, addresses: [{ address: "127.0.0.1", family: 4 }] }),
+      AUTH,
+    );
+    expect(out).toMatchObject({ ok: true, statusCode: 200 });
+  });
+
+  it("reports a refused connection with its code, like fetch", async () => {
+    const url = await serve((_req, res) => res.writeHead(200).end());
+    const port = new URL(url).port;
+    await new Promise<void>((resolve) => servers.pop()!.close(() => resolve()));
+    const out = await runHttpCheck(
+      `http://pinned.invalid:${port}/`,
+      2_000,
+      undefined,
+      undefined,
+      async () => ({ proceed: true, addresses: [{ address: "127.0.0.1", family: 4 }] }),
+      AUTH,
+    );
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain("ECONNREFUSED");
+  });
+});

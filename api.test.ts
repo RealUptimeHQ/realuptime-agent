@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   ApiClient,
   AuthError,
+  MAX_RESPONSE_BYTES,
   TransientError,
   VantageConflictError,
   parseChecks,
@@ -110,6 +111,25 @@ describe("ApiClient", () => {
     const fetchImpl = (async () =>
       new Response("not json", { status: 200 })) as unknown as typeof fetch;
     await expect(new ApiClient(config, fetchImpl).poll()).rejects.toBeInstanceOf(TransientError);
+  });
+
+  it("stops reading a response past MAX_RESPONSE_BYTES instead of buffering it whole", async () => {
+    // Valid JSON padded past the limit: before the cap it parsed fine, after
+    // a crafted response of any size it would have held the whole thing.
+    const padded = `{"checks":[]}${" ".repeat(MAX_RESPONSE_BYTES)}`;
+    const fetchImpl = (async () => new Response(padded, { status: 200 })) as unknown as typeof fetch;
+    await expect(new ApiClient(config, fetchImpl).poll()).rejects.toThrow(/byte limit/);
+    const declared = (async () =>
+      new Response("{}", { status: 200, headers: { "content-length": String(MAX_RESPONSE_BYTES + 1) } })) as unknown as typeof fetch;
+    await expect(new ApiClient(config, declared).poll()).rejects.toBeInstanceOf(TransientError);
+  });
+
+  it("still reads an ordinary poll body", async () => {
+    const fetchImpl = (async () =>
+      new Response(JSON.stringify({ checks: [{ id: "c1", type: "tcp", tcpHost: "db", tcpPort: 5432 }] }), {
+        status: 200,
+      })) as unknown as typeof fetch;
+    expect((await new ApiClient(config, fetchImpl).poll()).checks).toHaveLength(1);
   });
 
   it("refuses to send more than the contract's 100 results", async () => {

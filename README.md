@@ -33,7 +33,7 @@ needs nothing installed, verified against the same signed `SHA256SUMS`.
 Docker, one command:
 
 ```
-docker run -d --name realuptime-agent --restart unless-stopped --network host --pid host -v /:/host:ro -e REALUPTIME_TOKEN=rua_your_token_here ghcr.io/realuptimehq/agent:latest
+docker run -d --name realuptime-agent --restart unless-stopped --network host --pid host -v /:/host:ro --cap-drop ALL --security-opt no-new-privileges:true --read-only -e REALUPTIME_TOKEN=rua_your_token_here ghcr.io/realuptimehq/agent:latest
 ```
 
 `--network host` is part of the command, not an option (REA-780). An agent
@@ -56,8 +56,8 @@ The token is shown once, when you register the agent in the RealUptime
 dashboard. If you lose it, issue a new one: tokens are stored hashed, so
 nobody at RealUptime can read yours back to you.
 
-Verify the image before running it (optional, but this is what
-`install.sh` does automatically when `cosign` is on the machine):
+Verify the image before running it (this is what `install.sh` does
+automatically when cosign 3 or newer is on the machine):
 
 ```
 cosign verify --key https://realuptime.io/.well-known/cosign.pub \
@@ -69,13 +69,12 @@ pair generated for this purpose, with an SPDX software bill of materials and
 a provenance attestation (builder, git commit, build time) attached to the
 same digest, so a verify confirms both who built it and what's in it, not
 just that a signature exists. `install.sh` runs this same check itself on
-the Docker path: when `cosign` is present it verifies before the container
-starts and logs the result; when `cosign` is absent it says so plainly and
-runs the image unverified rather than silently skipping the check. Either
-way, verification never blocks the install: an unsigned or unverifiable
-image still runs, exactly as it always has for anyone not running `cosign`
-at all. Run the command above yourself first if you want that guarantee
-before the agent ever starts.
+the Docker path and refuses an image that fails it. Without cosign, or with
+a cosign older than 3.0 (which cannot read the signature format), it says
+so plainly and runs the image unverified; run the command above with
+cosign 3 first if you want the guarantee before the agent ever starts, or
+install with `--method systemd`, whose release signature is always
+checked.
 
 Images are published as `latest` and as the exact git commit SHA that built
 them (by the release pipeline), so pin the SHA tag instead of
@@ -158,10 +157,19 @@ directives in it are safe to keep. The agent writes nothing to disk.
 
 Published images are signed with cosign against a generated key pair, with an
 SPDX software bill of materials and a provenance record (builder, git commit,
-build time) attached as attestations on the same digest. Release tarballs
-ship with a `SHA256SUMS` file signed by the same key; `install.sh` verifies
-the checksum always and the signature whenever `cosign` is installed on the
-target. See
+build time) attached as attestations on the same digest. Every release
+ships a `SHA256SUMS` file signed by the same key. `install.sh` carries the
+public key, verifies the signature with openssl (or cosign when openssl is
+absent), then the checksum, and refuses a release that is unsigned or fails
+either check. To check one yourself:
+
+```
+cosign verify-blob --key https://realuptime.io/.well-known/cosign.pub \
+  --signature SHA256SUMS.sig --insecure-ignore-tlog=true SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+See
 [docs.realuptime.io/monitor-agent](https://docs.realuptime.io/monitor-agent#verify-the-image)
 for the verify command and the public key's stable URL.
 
@@ -305,6 +313,14 @@ named `BILLING_API_TOKEN`, never the token. The rules, all enforced here:
   placeholder text in it, and never sent without the header.
 - **The value is sent only to the check's own address.** On a redirect to
   another origin, the credential is left behind.
+- **The value is never sent to a public address.** A request that carries a
+  secret is judged with the public-address rule enforced, whatever
+  `REALUPTIME_EGRESS_POLICY` says, and its connection is pinned to the
+  addresses that rule approved. The check's address comes from RealUptime,
+  so without this anyone who could edit the check (a taken-over dashboard
+  account, or RealUptime itself) could point it at their own server and
+  collect the secret, by name or by a DNS record that changes between the
+  check and the dial.
 - **The value never appears anywhere else.** Every resolved value is scrubbed
   from this agent's log lines and from every error it reports to RealUptime,
   including a truncated fragment of one.
@@ -433,7 +449,9 @@ that instance every tick, alongside the OS-level sample:
 A role with `pg_monitor` (or superuser) can read every one of these; none of
 them touches your table data. Authentication supports trust (including
 peer authentication over a unix socket), cleartext password, MD5 and
-SCRAM-SHA-256, the Postgres 14+ default. There is no TLS support in this
+SCRAM-SHA-256, the Postgres 14+ default. A cleartext password is sent only
+over a unix socket or loopback; a server elsewhere that asks for one is
+refused, so use `scram-sha-256` in `pg_hba.conf`. There is no TLS support in this
 version: point the DSN at an
 instance reachable without one, typically `localhost` or the same private
 network the agent already runs on. For peer authentication over the local
@@ -461,9 +479,10 @@ and the agent reads one `INFO` reply from that instance every tick:
 
 Every one of these is a plain counter `INFO` already reports; the agent never
 issues a command that touches a key. Authentication supports a plain
-password (`AUTH`); there is no TLS support in this version, same limitation
-and same reasoning as PostgreSQL above. A DSN that is present but
-unreachable costs that tick's Redis reading only.
+password (`AUTH`). A `rediss://` DSN connects over TLS and verifies the
+server's certificate against the DSN's host before `AUTH` is sent; a
+`redis://` DSN is plaintext, so keep it on `localhost` or a private network.
+A DSN that is present but unreachable costs that tick's Redis reading only.
 
 ### MySQL metrics
 
@@ -703,6 +722,26 @@ logs into a data leak.
 The whole program is a few thousand lines of TypeScript with **zero runtime
 dependencies**, and it is in this repository. A security review is a short
 afternoon, which is how it was designed.
+
+## Security
+
+The agent runs on your machine with read access to it, its source is public,
+and it takes instructions from RealUptime's servers. What bounds that is
+written above: the closed check vocabulary, the egress policy, secrets that
+never leave this machine and never go to a public address, and no listening
+port. The installer's Docker command and the Kubernetes DaemonSet run the
+image as a non-root user with every capability dropped, no privilege
+escalation and a read-only root filesystem.
+
+To verify what you run, check the installer's published SHA-256 before
+piping it into a shell, and the release and image signatures with cosign
+(see [Verify the image and the releases](#verify-the-image-and-the-releases)).
+
+**Reporting a vulnerability.** Email security@realuptime.io. The policy,
+scope and response commitment are at
+https://realuptime.io/security/disclosure, and
+https://realuptime.io/.well-known/security.txt carries the same contact.
+Please do not open a public issue for a security report.
 
 ## Sizing and network
 

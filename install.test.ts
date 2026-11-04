@@ -1,6 +1,15 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,6 +75,8 @@ describe("installers", () => {
     const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
     expect(sh).toMatch(/^set -eu$/m);
     expect(sh).toContain("checksum mismatch");
+    expect(sh).toContain("refusing to install an unsigned release");
+    expect(sh).toContain("openssl dgst -sha256 -verify");
     expect(sh).toContain("cosign verify-blob");
     expect(sh).toContain("--env-file");
     expect(sh).toContain("EnvironmentFile=");
@@ -76,13 +87,12 @@ describe("installers", () => {
     expect(sh).not.toMatch(/ExecStart=.*\$TOKEN/);
   });
 
-  // REA-475: the Docker install path gained the same courtesy signature
-  // check the tarball path already had -- verify when cosign is present,
-  // log honestly and run unverified when it isn't. Never a hard gate.
+  // The Docker path refuses an image cosign cannot verify; without cosign
+  // (or with one too old to read a sigstore bundle) it says so and runs it.
   it("the Docker install path verifies the image signature with cosign when it is present, and logs honestly when it is not", () => {
     const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
-    expect(sh).toContain("cosign verify --key");
-    expect(sh).toContain("$COSIGN_KEY_URL");
+    expect(sh).toContain('cosign verify --key "$key"');
+    expect(sh).toContain("refusing to run it");
     expect(sh).toMatch(/cosign not found: skipping image signature verification/);
     // The verify call happens before the image is ever run, and the
     // function that does it is called from install_docker.
@@ -121,12 +131,40 @@ describe("installers", () => {
     expect(runLine).toContain("-v /:/host:ro");
   });
 
+  // The DaemonSet drops every capability and forbids privilege escalation;
+  // the Docker path ran with Docker's default capability set instead.
+  it("the Docker install path drops every capability, like the DaemonSet", () => {
+    const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
+    const runLine = sh
+      .split("\n")
+      .find((line) => line.includes("docker run -d --name realuptime-agent"));
+    expect(runLine).toContain("--cap-drop ALL");
+    expect(runLine).toContain("--security-opt no-new-privileges:true");
+    expect(runLine).toContain("--read-only");
+  });
+
+  it("the Linux installer pins the same release key the website serves", () => {
+    const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
+    const pinned = /RELEASE_PUBKEY_PEM="([^"]+)"/.exec(sh)?.[1];
+    expect(pinned).toContain("BEGIN PUBLIC KEY");
+    const served = join(HERE, "..", "web", "public", ".well-known", "cosign.pub");
+    if (IN_MONOREPO) expect(pinned).toBe(readFileSync(served, "utf8").trim());
+  });
+
   it("the Windows installer verifies the checksum and runs the agent as LOCAL SERVICE under Task Scheduler", () => {
     const ps = readFileSync(join(HERE, "install", "install-windows.ps1"), "utf8");
     expect(ps).toContain("checksum mismatch");
     expect(ps).toContain("NT AUTHORITY\\LOCAL SERVICE");
     expect(ps).toContain("Register-ScheduledTask");
     expect(ps).toContain("-AtStartup");
+  });
+
+  it("the Windows installer restricts env.json before it writes the token into it", () => {
+    const ps = readFileSync(join(HERE, "install", "install-windows.ps1"), "utf8");
+    const locked = ps.indexOf("Set-Acl $envFile $acl");
+    const written = ps.indexOf("ConvertTo-Json -Compress | Set-Content -Path $envFile");
+    expect(locked).toBeGreaterThan(0);
+    expect(written).toBeGreaterThan(locked);
   });
 
   // REA-601: the Linux installer used to resolve "latest" by hitting the
@@ -229,7 +267,7 @@ describe("install.sh when the agent image cannot be pulled (REA-841)", () => {
     write("docker", 'case "$1" in info) exit 0;; rm) exit 0;; run) echo "Error response from daemon: denied: requested access to the resource is denied" >&2; exit 1;; esac; exit 0');
     write("node", 'echo 22');
     write("curl", "exit 22");
-    write("cosign", "exit 1");
+    write("cosign", "exit 0");
     write("uname", "echo Linux");
     return bin;
   }
@@ -291,7 +329,7 @@ describe("install.sh picks a method by what can actually be done", () => {
     );
     if (opts.node !== false) write("node", "echo 22");
     write("curl", "exit 22");
-    write("cosign", "exit 1");
+    write("cosign", "exit 0");
     write("uname", `echo ${opts.os ?? "Linux"}`);
     write("launchctl", "exit 0");
     write("sudo", 'exec "$@"');
@@ -357,5 +395,145 @@ describe("install.sh on macOS", () => {
 
   it("checks the release checksum with shasum when sha256sum is absent", () => {
     expect(sh).toContain("shasum -a 256");
+  });
+});
+
+/**
+ * The release signature gate, run for real: a local release signed with a
+ * throwaway P-256 key (cosign's detached signature is an ECDSA signature
+ * over the file's SHA-256, base64 encoded, so openssl makes one), a fake
+ * `curl` that serves it, and fake `id` and `sudo` so the run stops at the
+ * first privileged step after verification. REALUPTIME_RELEASE_PUBKEY
+ * points the installer at the throwaway key.
+ */
+describe("install.sh refuses a release it cannot verify", () => {
+  const hasOpenssl = spawnSync("openssl", ["version"]).status === 0;
+
+  function release(opts: { sign?: "good" | "none" | "tampered" } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "agent-install-sig-"));
+    const rel = join(dir, "release", "agent-9.9.9");
+    mkdirSync(rel, { recursive: true });
+    const key = join(dir, "key.pem");
+    const pub = join(dir, "key.pub");
+    spawnSync("openssl", ["ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key]);
+    spawnSync("openssl", ["ec", "-in", key, "-pubout", "-out", pub]);
+    const tgz = join(rel, "realuptime-agent-9.9.9.tgz");
+    writeFileSync(tgz, "not really a tarball");
+    const sum = createHash("sha256").update(readFileSync(tgz)).digest("hex");
+    const sums = join(rel, "SHA256SUMS");
+    writeFileSync(sums, `${sum}  realuptime-agent-9.9.9.tgz\n`);
+    if (opts.sign !== "none") {
+      const der = spawnSync("openssl", ["dgst", "-sha256", "-sign", key, sums]).stdout;
+      writeFileSync(join(rel, "SHA256SUMS.sig"), Buffer.from(der).toString("base64"));
+    }
+    if (opts.sign === "tampered") {
+      writeFileSync(sums, `${"0".repeat(64)}  realuptime-agent-9.9.9.tgz\n`);
+    }
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const write = (name: string, body: string) => {
+      writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
+      chmodSync(join(bin, name), 0o755);
+    };
+    // curl -fsSL -o OUT URL: serve URL's last two segments from the release dir.
+    write(
+      "curl",
+      `out=""; url=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift;; -*) ;; *) url="$1";; esac; shift; done
+f="${dir}/release/$(echo "$url" | awk -F/ '{print $(NF-1)"/"$NF}')"
+[ -f "$f" ] || exit 22; cp "$f" "$out"`,
+    );
+    write("node", "echo 22");
+    write("uname", "echo Linux");
+    write("systemctl", "exit 0");
+    write("id", 'case "$1" in -u) echo 1000;; *) exit 1;; esac');
+    write("sudo", "echo SUDO-REACHED; exit 1");
+    return { bin, pub };
+  }
+
+  // A PATH with every system tool except openssl and cosign.
+  function withoutVerifiers(bin: string): string {
+    const tools = join(dirname(bin), "tools");
+    mkdirSync(tools);
+    for (const dir of ["/usr/bin", "/bin"]) {
+      if (!existsSync(dir)) continue;
+      for (const name of readdirSync(dir)) {
+        if (name === "openssl" || name === "cosign" || existsSync(join(tools, name))) continue;
+        symlinkSync(join(dir, name), join(tools, name));
+      }
+    }
+    return `${bin}:${tools}`;
+  }
+
+  function run(env: ReturnType<typeof release>, path = `${env.bin}:/usr/bin:/bin`) {
+    const result = spawnSync(
+      "sh",
+      [join(HERE, "install", "install.sh"), "--token", "rua_test", "--method", "systemd", "--version", "9.9.9"],
+      {
+        encoding: "utf8",
+        env: {
+          PATH: path,
+          HOME: tmpdir(),
+          REALUPTIME_RELEASE_BASE: "https://releases.test/download",
+          REALUPTIME_RELEASE_PUBKEY: env.pub,
+        },
+      },
+    );
+    return { out: result.stdout + result.stderr, status: result.status };
+  }
+
+  it.skipIf(!hasOpenssl)("verifies a signed release, then goes on to install it", () => {
+    const result = run(release());
+    expect(result.out).toContain("verified release signature");
+    expect(result.out).toContain("verified SHA256 checksum");
+    expect(result.out).toContain("SUDO-REACHED");
+  });
+
+  it.skipIf(!hasOpenssl)("refuses a release with no signature", () => {
+    const result = run(release({ sign: "none" }));
+    expect(result.status).not.toBe(0);
+    expect(result.out).toContain("refusing to install an unsigned release");
+    expect(result.out).not.toContain("SUDO-REACHED");
+  });
+
+  it.skipIf(!hasOpenssl)("refuses SHA256SUMS that no longer matches its signature", () => {
+    const result = run(release({ sign: "tampered" }));
+    expect(result.status).not.toBe(0);
+    expect(result.out).toContain("did not verify");
+    expect(result.out).not.toContain("SUDO-REACHED");
+  });
+
+  it.skipIf(!hasOpenssl)("refuses when nothing on the machine can check a signature", () => {
+    const env = release();
+    const result = run(env, withoutVerifiers(env.bin));
+    expect(result.status).not.toBe(0);
+    expect(result.out).toContain("neither openssl nor cosign is installed");
+    expect(result.out).not.toContain("SUDO-REACHED");
+  });
+
+  it("refuses an image cosign 3 cannot verify, and says so when cosign is too old to read it", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-install-img-"));
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const write = (name: string, body: string) => {
+      writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
+      chmodSync(join(bin, name), 0o755);
+    };
+    write("docker", 'case "$1" in info) exit 0;; pull) exit 0;; rm) exit 0;; run) echo cid; exit 0;; esac; exit 0');
+    write("node", "echo 22");
+    write("uname", "echo Linux");
+    const go = (version: string) => {
+      write("cosign", `case "$1" in version) echo "GitVersion:    ${version}";; *) exit 1;; esac`);
+      const result = spawnSync("sh", [join(HERE, "install", "install.sh"), "--token", "rua_test", "--method", "docker"], {
+        encoding: "utf8",
+        env: { PATH: `${bin}:/usr/bin:/bin`, HOME: tmpdir() },
+      });
+      return { out: result.stdout + result.stderr, status: result.status };
+    };
+    const v3 = go("v3.1.4");
+    expect(v3.status).not.toBe(0);
+    expect(v3.out).toContain("refusing to run it");
+    const v2 = go("v2.4.3");
+    expect(v2.out).toContain("cannot read the signature");
+    expect(v2.out).not.toContain("refusing to run it");
   });
 });

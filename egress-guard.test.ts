@@ -71,6 +71,23 @@ describe("createEgressGuard", () => {
     expect(report.drain()).toMatchObject({ refused: 0, wouldRefuse: 1, byRule: { public: 1 } });
   });
 
+  it("report mode does NOT send a credential to a public address", async () => {
+    // A check URL is chosen by the server. In report mode an ordinary probe
+    // of a public host proceeds, but one carrying a secret resolved on this
+    // machine would hand that secret to whoever the server pointed it at.
+    const guard = createEgressGuard(REPORTING, new EgressReport(), lookupReturning({ "collector.example": ["93.184.216.34"] }));
+    const ordinary = await guard("collector.example", 443);
+    expect(ordinary.proceed).toBe(true);
+    const credentialed = await guard("collector.example", 443, { credentialed: true });
+    expect(credentialed.proceed).toBe(false);
+    expect(credentialed.error).toBe(`${EGRESS_BLOCKED_MESSAGE} (public address)`);
+  });
+
+  it("report mode still sends a credential to a private address", async () => {
+    const guard = createEgressGuard(REPORTING, new EgressReport(), lookupReturning({ "billing.internal": ["10.0.0.7"] }));
+    expect((await guard("billing.internal", 443, { credentialed: true })).proceed).toBe(true);
+  });
+
   it("report mode does NOT proceed past a metadata endpoint", async () => {
     const report = new EgressReport();
     const guard = createEgressGuard(REPORTING, report, lookupReturning({ h: ["169.254.169.254"] }));

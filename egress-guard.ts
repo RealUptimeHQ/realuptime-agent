@@ -31,18 +31,19 @@ import { log } from "./log.ts";
  *    only evidence enforcement would produce is what this counter holds. It is
  *    the number the decision to enforce gets made on.
  *
- * ## The one honest gap: http
+ * ## http: pinned when it carries a credential
  *
  * `node:net` and `node:tls` accept a `lookup` option, so a tcp or ping probe
  * is genuinely pinned. Node's global `fetch` does not expose one without
  * pulling undici in as a dependency, which this package deliberately does not
- * have. So an http probe is checked against a resolution taken immediately
- * before the request and re-checked on every redirect hop, and the residual
- * window is between our lookup and fetch's own, measured in milliseconds.
- * That is weaker than a pin and it is stated plainly rather than papered over:
- * closing it means either taking a dependency or dialling the IP directly and
- * losing SNI, and both are decisions for a later phase, not something to
- * decide inside a hardening change.
+ * have. So an ordinary http probe is checked against a resolution taken
+ * immediately before the request and re-checked on every redirect hop, and
+ * the residual window is between our lookup and fetch's own, measured in
+ * milliseconds. A request that carries a credential resolved on this machine
+ * cannot accept that window, because a name its author controls can rebind
+ * inside it and collect the credential; `check-http.ts` sends those through
+ * `pinned-fetch.ts`, which replays this guard's addresses into `node:https`
+ * exactly as tcp does.
  */
 
 /** A validated address, in the shape `node:net`'s `lookup` option wants. */
@@ -63,9 +64,22 @@ export interface EgressDecision {
   addresses: PinnedAddress[];
 }
 
+/** How a dial will be used, when that changes the verdict. */
+export interface EgressDialOptions {
+  /** The request carries a credential resolved on this machine (secrets.ts).
+   * The public-address rule is then enforced whatever the mode: in report
+   * mode a server-chosen check URL could otherwise carry this machine's
+   * secret to any host on the internet. */
+  credentialed?: boolean;
+}
+
 /** What a prober calls before it dials. `port` is null for a target with no
  * port concept at this layer. */
-export type EgressGuard = (host: string, port: number | null) => Promise<EgressDecision>;
+export type EgressGuard = (
+  host: string,
+  port: number | null,
+  options?: EgressDialOptions,
+) => Promise<EgressDecision>;
 
 export type LookupFn = (
   hostname: string,
@@ -140,7 +154,7 @@ export function createEgressGuard(
   report: EgressReport,
   lookup: LookupFn = defaultLookup,
 ): EgressGuard {
-  return async (rawHost: string, port: number | null): Promise<EgressDecision> => {
+  return async (rawHost: string, port: number | null, options?: EgressDialOptions): Promise<EgressDecision> => {
     const host = normalizeHost(rawHost);
     if (!host) {
       return { proceed: false, error: `${EGRESS_BLOCKED_MESSAGE} (no host)`, addresses: [] };
@@ -158,10 +172,14 @@ export function createEgressGuard(
       }
     }
 
-    const verdict = evaluateEgress(
+    const evaluated = evaluateEgress(
       { host, port, addresses: resolved.map(({ address }) => address) },
       policy,
     );
+    const verdict =
+      !evaluated.allow && !evaluated.enforced && options?.credentialed && evaluated.rule === "public"
+        ? { ...evaluated, enforced: true }
+        : evaluated;
 
     if (verdict.allow) {
       return { proceed: true, addresses: resolved };
