@@ -526,9 +526,12 @@ const QUERY_BATCH = [
   // pg_stat_activity so the two do not cost two round trips. Only client
   // backends run queries: a replica's walsender is "active" from the moment
   // it connects, and would read as a query running for days.
+  // clock_timestamp(), not now(): now() is this statement's own transaction
+  // start, so a query that began a moment after it read as a negative age,
+  // and the ingest refused every batch that carried one (REA-1164).
   `select
      count(*) filter (where pid <> pg_backend_pid())::int as connections,
-     coalesce(extract(epoch from max(now() - query_start) filter (where state = 'active' and backend_type = 'client backend' and pid <> pg_backend_pid())), 0)::double precision as longest_query_seconds
+     coalesce(extract(epoch from max(greatest(clock_timestamp() - query_start, interval '0')) filter (where state = 'active' and backend_type = 'client backend' and pid <> pg_backend_pid())), 0)::double precision as longest_query_seconds
    from pg_stat_activity`,
   // 2: the configured ceiling connections is measured against.
   `select setting::int as max_connections from pg_settings where name = 'max_connections'`,
@@ -563,7 +566,7 @@ function buildSample(results: PgStatementResult[]): PostgresSample {
             .map((row) => ({ name: row[nameIdx]!, sizeBytes: Number(row[sizeIdx] ?? 0) }))
         : [],
     cacheHitRatio: total > 0 ? blksHit / total : null,
-    longestQuerySeconds: toNumber(col(activity, "longest_query_seconds")) ?? 0,
+    longestQuerySeconds: Math.max(0, toNumber(col(activity, "longest_query_seconds")) ?? 0),
     replicationLagSeconds: toNumber(col(replication, "lag_seconds")),
   };
 }

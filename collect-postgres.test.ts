@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { createHash, createHmac, pbkdf2Sync } from "node:crypto";
 import * as net from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
@@ -246,6 +247,30 @@ describe("PostgresCollector", () => {
       longestQuerySeconds: 12.5,
       replicationLagSeconds: 1.5,
     });
+  });
+
+  // REA-1164: a negative age made production refuse every batch from db1.
+  it("never reports a negative longest query, whatever the server returns", async () => {
+    const port = await startFakeServer((socket) => {
+      socket.write(
+        Buffer.concat([
+          statement(["connections", "longest_query_seconds"], [["2", "-0.531956"]]),
+          statement(["max_connections"], [["100"]]),
+          statement(["blks_hit", "blks_read"], [["0", "0"]]),
+          statement(["datname", "size_bytes"], []),
+          statement(["lag_seconds"], []),
+          readyForQuery(),
+        ]),
+      );
+    });
+    const collector = new PostgresCollector(`postgresql://monitor@127.0.0.1:${port}/appdb`);
+    expect((await collector.collect())?.longestQuerySeconds).toBe(0);
+  });
+
+  it("measures query age from the clock, not from its own transaction start", async () => {
+    const source = readFileSync(new URL("./collect-postgres.ts", import.meta.url), "utf8");
+    expect(source).toContain("greatest(clock_timestamp() - query_start, interval '0')");
+    expect(source).not.toContain("now() - query_start");
   });
 
   it("authenticates with md5 when challenged", async () => {

@@ -9,7 +9,7 @@
  * in sync with the `version` field in `package.json` by hand when either
  * changes.
  */
-export const AGENT_VERSION = "0.4.0";
+export const AGENT_VERSION = "0.4.1";
 
 /**
  * What this build can do beyond the four probe verbs, declared on every poll
