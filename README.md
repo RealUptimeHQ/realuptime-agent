@@ -139,6 +139,24 @@ Package build scripts and the repository layout are in `packaging/`
 published yet; the scripts exist so the layout is decided before the first
 package, not improvised at publish time.
 
+### The Go build (preview)
+
+Each release built with Go on the release machine also carries the same agent built in Go
+(`apps/agent-go`): one static executable per platform
+(`realuptime-agent-go-<version>-linux-x64`, `-linux-arm64`, `-darwin-x64`,
+`-darwin-arm64`, `-windows-x64.exe`), listed in the same signed
+`SHA256SUMS`. It speaks the same API, runs the same checks and reports the
+same metrics, and needs neither Node.js nor Docker. It is opt-in while it is
+measured beside this build:
+
+```
+curl -fsSL https://realuptime.io/agent/install.sh | REALUPTIME_TOKEN=rua_... sh -s -- --build go
+```
+
+On Windows, `Install-RealUptimeAgent -Token rua_... -Build go`. The installer
+picks the systemd method on Linux and launchd on macOS; `--build go` with
+`--method docker` is refused, since the image is the Node.js build.
+
 ### From source
 
 Node.js 22 or newer:

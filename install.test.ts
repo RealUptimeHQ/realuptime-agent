@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -409,7 +410,7 @@ describe("install.sh on macOS", () => {
 describe("install.sh refuses a release it cannot verify", () => {
   const hasOpenssl = spawnSync("openssl", ["version"]).status === 0;
 
-  function release(opts: { sign?: "good" | "none" | "tampered" } = {}) {
+  function release(opts: { sign?: "good" | "none" | "tampered"; go?: boolean } = {}) {
     const dir = mkdtempSync(join(tmpdir(), "agent-install-sig-"));
     const rel = join(dir, "release", "agent-9.9.9");
     mkdirSync(rel, { recursive: true });
@@ -421,7 +422,13 @@ describe("install.sh refuses a release it cannot verify", () => {
     writeFileSync(tgz, "not really a tarball");
     const sum = createHash("sha256").update(readFileSync(tgz)).digest("hex");
     const sums = join(rel, "SHA256SUMS");
-    writeFileSync(sums, `${sum}  realuptime-agent-9.9.9.tgz\n`);
+    let listing = `${sum}  realuptime-agent-9.9.9.tgz\n`;
+    if (opts.go !== false) {
+      const goBin = join(rel, "realuptime-agent-go-9.9.9-linux-x64");
+      writeFileSync(goBin, "not really an executable");
+      listing += `${createHash("sha256").update(readFileSync(goBin)).digest("hex")}  realuptime-agent-go-9.9.9-linux-x64\n`;
+    }
+    writeFileSync(sums, listing);
     if (opts.sign !== "none") {
       const der = spawnSync("openssl", ["dgst", "-sha256", "-sign", key, sums]).stdout;
       writeFileSync(join(rel, "SHA256SUMS.sig"), Buffer.from(der).toString("base64"));
@@ -443,7 +450,7 @@ f="${dir}/release/$(echo "$url" | awk -F/ '{print $(NF-1)"/"$NF}')"
 [ -f "$f" ] || exit 22; cp "$f" "$out"`,
     );
     write("node", "echo 22");
-    write("uname", "echo Linux");
+    write("uname", 'case "$1" in -m) echo x86_64;; *) echo Linux;; esac');
     write("systemctl", "exit 0");
     write("id", 'case "$1" in -u) echo 1000;; *) exit 1;; esac');
     write("sudo", "echo SUDO-REACHED; exit 1");
@@ -464,10 +471,10 @@ f="${dir}/release/$(echo "$url" | awk -F/ '{print $(NF-1)"/"$NF}')"
     return `${bin}:${tools}`;
   }
 
-  function run(env: ReturnType<typeof release>, path = `${env.bin}:/usr/bin:/bin`) {
+  function run(env: ReturnType<typeof release>, path = `${env.bin}:/usr/bin:/bin`, extra: string[] = ["--method", "systemd"]) {
     const result = spawnSync(
       "sh",
-      [join(HERE, "install", "install.sh"), "--token", "rua_test", "--method", "systemd", "--version", "9.9.9"],
+      [join(HERE, "install", "install.sh"), "--token", "rua_test", ...extra, "--version", "9.9.9"],
       {
         encoding: "utf8",
         env: {
@@ -508,6 +515,32 @@ f="${dir}/release/$(echo "$url" | awk -F/ '{print $(NF-1)"/"$NF}')"
     expect(result.status).not.toBe(0);
     expect(result.out).toContain("neither openssl nor cosign is installed");
     expect(result.out).not.toContain("SUDO-REACHED");
+  });
+
+  it.skipIf(!hasOpenssl)("--build go verifies and installs the release's Go executable, Node.js or not", () => {
+    const env = release();
+    rmSync(join(env.bin, "node"));
+    const result = run(env, `${env.bin}:/usr/bin:/bin`, ["--build", "go"]);
+    expect(result.out).toContain("(realuptime-agent-go-9.9.9-linux-x64)");
+    expect(result.out).toContain("verified SHA256 checksum");
+    expect(result.out).toContain("SUDO-REACHED");
+  });
+
+  it("--build go stops on a release without a Go build, before anything is installed", () => {
+    const result = run(release({ go: false }), undefined, ["--build", "go"]);
+    expect(result.status).not.toBe(0);
+    expect(result.out).toContain("has no Go build for linux");
+    expect(result.out).not.toContain("SUDO-REACHED");
+  });
+
+  it("--build go refuses the docker method, and an unknown build is refused", () => {
+    const env = release();
+    const docker = run(env, undefined, ["--build", "go", "--method", "docker"]);
+    expect(docker.status).not.toBe(0);
+    expect(docker.out).toContain("--build go installs a native service");
+    const bogus = run(env, undefined, ["--build", "rust"]);
+    expect(bogus.status).not.toBe(0);
+    expect(bogus.out).toContain("unknown --build rust");
   });
 
   it("refuses an image cosign 3 cannot verify, and says so when cosign is too old to read it", () => {

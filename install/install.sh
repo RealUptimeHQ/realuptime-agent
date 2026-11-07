@@ -16,7 +16,7 @@
 # `sha256sum install.sh`), so a change here without regenerating that
 # checksum fails the suite rather than shipping a script whose published
 # hash no longer matches what `curl | sh` actually fetches.
-INSTALLER_SCRIPT_VERSION="7"
+INSTALLER_SCRIPT_VERSION="8"
 #
 # What it does, in order, and nothing else:
 #   1. Picks a method by what can actually be done on this host. On macOS
@@ -66,6 +66,10 @@ INSTALLER_SCRIPT_VERSION="7"
 #   --cluster NAME       optional cluster label (REALUPTIME_CLUSTER)
 #   --node NAME          optional node label (REALUPTIME_NODE), default hostname
 #   --version VER        pin a release (default: latest, or REALUPTIME_AGENT_VERSION)
+#   --build node|go      which build of the agent to install (default node, or
+#                        REALUPTIME_AGENT_BUILD). go installs the release's
+#                        static Go executable (apps/agent-go) with the systemd
+#                        or launchd method: no Node.js and no Docker needed.
 #   --print-version      resolve and print the release tag this run would
 #                        install, then exit; no token needed, nothing installed
 #   --uninstall          stop and remove the systemd or launchd install
@@ -112,6 +116,7 @@ METHOD=""
 CLUSTER="${REALUPTIME_CLUSTER:-}"
 NODE_LABEL="${REALUPTIME_NODE:-}"
 VERSION="${REALUPTIME_AGENT_VERSION:-latest}"
+BUILD="${REALUPTIME_AGENT_BUILD:-node}"
 UNINSTALL=0
 PRINT_VERSION=0
 
@@ -127,9 +132,10 @@ while [ $# -gt 0 ]; do
     --cluster) CLUSTER="$2"; shift 2 ;;
     --node) NODE_LABEL="$2"; shift 2 ;;
     --version) VERSION="$2"; shift 2 ;;
+    --build) BUILD="$2"; shift 2 ;;
     --print-version) PRINT_VERSION=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
-    -h|--help) sed -n '2,71p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,75p' "$0"; exit 0 ;;
     *) die "unknown flag: $1" ;;
   esac
 done
@@ -203,6 +209,10 @@ fi
 
 [ -n "$TOKEN" ] || die "no token. Pass --token rua_... (shown once when you register the agent in the dashboard)."
 case "$TOKEN" in rua_*) ;; *) die "that does not look like an agent token (expected rua_...)";; esac
+case "$BUILD" in node|go) ;; *) die "unknown --build $BUILD (node|go)" ;; esac
+if [ "$BUILD" = go ] && [ "$METHOD" = docker ]; then
+  die "--build go installs a native service; use --method systemd (Linux) or launchd (macOS)"
+fi
 
 # Node.js 22+ present: the binary install can run on this host.
 node_ok() {
@@ -225,6 +235,8 @@ if [ -z "$METHOD" ]; then
   METHOD_CHOSEN_BY_US=1
   if [ "$OS_NAME" = "Darwin" ]; then
     METHOD=launchd
+  elif [ "$BUILD" = go ]; then
+    METHOD=systemd
   elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     if image_pullable; then
       METHOD=docker
@@ -392,7 +404,13 @@ install_systemd() {
   # Node.js 22+ on the machine runs the small tarball. Without it (most
   # database servers have neither Node.js nor Docker), the release's
   # standalone executable carries its own Node.js and needs nothing else.
-  if node_ok; then
+  if [ "$BUILD" = go ]; then
+    arch="$(binary_arch)"
+    artifact="realuptime-agent-go-$version-linux-$arch"
+    if [ -z "$arch" ] || ! grep -q " $artifact\$" "$work/SHA256SUMS"; then
+      die "$tag has no Go build for linux $(uname -m); install without --build go"
+    fi
+  elif node_ok; then
     artifact="realuptime-agent-$version.tgz"
   else
     arch="$(binary_arch)"
@@ -410,7 +428,7 @@ install_systemd() {
       || as_root adduser --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
   fi
   as_root mkdir -p "$INSTALL_DIR" "$ENV_DIR"
-  if node_ok; then
+  if [ "$BUILD" != go ] && node_ok; then
     as_root tar -xzf "$work/$artifact" -C "$INSTALL_DIR" --strip-components=1
     exec_start="$(command -v node) $INSTALL_DIR/dist/agent.js"
   else
@@ -468,21 +486,35 @@ sh_quote() {
 install_launchd() {
   [ "$OS_NAME" = "Darwin" ] || die "--method launchd is for macOS; on this host use docker or systemd"
   need curl; need tar; need launchctl
-  node_ok || die "Node.js 22 or newer is required on macOS (brew install node, or nodejs.org), and was not found"
+  [ "$BUILD" = go ] || node_ok || die "Node.js 22 or newer is required on macOS (brew install node, or nodejs.org), and was not found; or install the Go build with --build go"
   say "installing the release binary as a launchd daemon"
 
   tag="$(resolve_agent_tag)" || exit 1
   work="$(mktemp -d)"
-  tarball="$work/realuptime-agent-${tag#agent-}.tgz"
-  say "downloading $tag"
-  curl -fsSL -o "$tarball" "$RELEASE_BASE/$tag/realuptime-agent-${tag#agent-}.tgz"
+  if [ "$BUILD" = go ]; then
+    artifact="realuptime-agent-go-${tag#agent-}-darwin-$(binary_arch)"
+  else
+    artifact="realuptime-agent-${tag#agent-}.tgz"
+  fi
+  say "downloading $tag ($artifact)"
   curl -fsSL -o "$work/SHA256SUMS" "$RELEASE_BASE/$tag/SHA256SUMS"
   curl -fsSL -o "$work/SHA256SUMS.sig" "$RELEASE_BASE/$tag/SHA256SUMS.sig" || : > "$work/SHA256SUMS.sig"
-  verify_release "$tarball" "$work/SHA256SUMS" "$work/SHA256SUMS.sig"
+  if [ "$BUILD" = go ] && ! grep -q " $artifact\$" "$work/SHA256SUMS"; then
+    die "$tag has no Go build for macOS $(uname -m); install without --build go"
+  fi
+  curl -fsSL -o "$work/$artifact" "$RELEASE_BASE/$tag/$artifact"
+  verify_release "$work/$artifact" "$work/SHA256SUMS" "$work/SHA256SUMS.sig"
 
   as_root launchctl bootout "system/$MAC_LABEL" 2>/dev/null || true
   as_root mkdir -p "$MAC_INSTALL_DIR" "$MAC_ENV_DIR"
-  as_root tar -xzf "$tarball" -C "$MAC_INSTALL_DIR" --strip-components=1
+  if [ "$BUILD" = go ]; then
+    as_root mkdir -p "$MAC_INSTALL_DIR/bin"
+    as_root install -m 0755 "$work/$artifact" "$MAC_INSTALL_DIR/bin/realuptime-agent"
+    mac_exec="$MAC_INSTALL_DIR/bin/realuptime-agent"
+  else
+    as_root tar -xzf "$work/$artifact" -C "$MAC_INSTALL_DIR" --strip-components=1
+    mac_exec="$(command -v node) $MAC_INSTALL_DIR/dist/agent.js"
+  fi
   as_root chown -R root:wheel "$MAC_INSTALL_DIR"
 
   # The token lives in a file only the service user can read, sourced by the
@@ -501,7 +533,6 @@ install_launchd() {
   as_root touch "$MAC_LOG"
   as_root chown nobody:wheel "$MAC_LOG"
 
-  node_bin="$(command -v node)"
   tmpplist="$(mktemp)"
   cat > "$tmpplist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -514,7 +545,7 @@ install_launchd() {
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <string>set -a; . $MAC_ENV_FILE; set +a; exec $node_bin $MAC_INSTALL_DIR/dist/agent.js</string>
+    <string>set -a; . $MAC_ENV_FILE; set +a; exec $mac_exec</string>
   </array>
   <key>UserName</key>
   <string>nobody</string>

@@ -14,7 +14,12 @@
 #                                standalone executables with Node.js built
 #                                in (build-binary.sh), which install.sh uses
 #                                on a host with neither Node.js nor Docker
-#   SHA256SUMS                   over the archives and the executables
+#   realuptime-agent-go-<ver>-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,
+#                                windows-x64.exe}
+#                                the Go build (apps/agent-go), static, which
+#                                install.sh --build go and install-windows.ps1
+#                                -Build go install; built when Go is on PATH
+#   SHA256SUMS                  over the archives and the executables
 #   SHA256SUMS.sig               cosign signature over SHA256SUMS (--sign,
 #                                needs COSIGN_KEY pointing at the private key
 #                                whose public half is served at
@@ -53,8 +58,20 @@ fi
 
 REALUPTIME_AGENT_BINARY_TARGETS="linux-x64 linux-arm64" sh "$HERE/build-binary.sh"
 
-( cd "$OUT" && sha256sum realuptime-agent-"$VERSION".tgz realuptime-agent-"$VERSION".zip realuptime-agent-"$VERSION"-linux-x64 realuptime-agent-"$VERSION"-linux-arm64 2>/dev/null > SHA256SUMS \
-    || sha256sum realuptime-agent-"$VERSION".tgz realuptime-agent-"$VERSION"-linux-x64 realuptime-agent-"$VERSION"-linux-arm64 > SHA256SUMS )
+GO_BUILDS=""
+if command -v go >/dev/null 2>&1; then
+  GO_OUT="$(mktemp -d)"
+  sh "$ROOT/apps/agent-go/packaging/build-release.sh" "$VERSION" "$GO_OUT"
+  mv "$GO_OUT"/realuptime-agent-go-"$VERSION"-* "$OUT/"
+  rm -rf "$GO_OUT"
+  GO_BUILDS="$(cd "$OUT" && ls realuptime-agent-go-"$VERSION"-*)"
+else
+  echo "go not installed; skipping the Go build"
+fi
+
+# shellcheck disable=SC2086 # GO_BUILDS is a list of file names
+( cd "$OUT" && sha256sum realuptime-agent-"$VERSION".tgz realuptime-agent-"$VERSION".zip realuptime-agent-"$VERSION"-linux-x64 realuptime-agent-"$VERSION"-linux-arm64 $GO_BUILDS 2>/dev/null > SHA256SUMS \
+    || sha256sum realuptime-agent-"$VERSION".tgz realuptime-agent-"$VERSION"-linux-x64 realuptime-agent-"$VERSION"-linux-arm64 $GO_BUILDS > SHA256SUMS )
 
 if [ "$SIGN" -eq 1 ]; then
   [ -n "${COSIGN_KEY:-}" ] || { echo "--sign needs COSIGN_KEY" >&2; exit 1; }

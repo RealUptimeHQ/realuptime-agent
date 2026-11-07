@@ -26,9 +26,10 @@
   care which supervisor it runs under.
 
   What it does, in order, and nothing else:
-    1. Requires Node.js 22+ (https://nodejs.org) on PATH.
-    2. Downloads the release zip and SHA256SUMS, verifies the checksum, and
-       refuses to unpack on a mismatch.
+    1. Requires Node.js 22+ (https://nodejs.org) on PATH, unless -Build go.
+    2. Downloads the release zip (or, with -Build go, the release's Go
+       executable) and SHA256SUMS, verifies the checksum, and refuses to
+       unpack on a mismatch.
     3. Unpacks to the install directory, writes the token to
        <install>\env.json readable by Administrators and LOCAL SERVICE only.
     4. Registers and starts the scheduled task.
@@ -48,6 +49,10 @@
   Pin a release (default: latest, or REALUPTIME_AGENT_VERSION). The tag is
   resolved from the public mirror repository's own releases via the GitHub
   API, filtered to agent-* tags (REA-601).
+.PARAMETER Build
+  Which build of the agent to install: node (default, or
+  REALUPTIME_AGENT_BUILD) or go, the release's static Go executable
+  (apps/agent-go), which needs no Node.js.
 .PARAMETER PrintVersion
   Resolve and print the release tag this run would install, then exit; no
   token needed, nothing installed.
@@ -61,6 +66,7 @@ param(
   [string] $Cluster = $env:REALUPTIME_CLUSTER,
   [string] $Node = $env:REALUPTIME_NODE,
   [string] $Version = $(if ($env:REALUPTIME_AGENT_VERSION) { $env:REALUPTIME_AGENT_VERSION } else { "latest" }),
+  [ValidateSet("node", "go")] [string] $Build = $(if ($env:REALUPTIME_AGENT_BUILD) { $env:REALUPTIME_AGENT_BUILD } else { "node" }),
   [switch] $PrintVersion,
   [switch] $Uninstall
 )
@@ -118,23 +124,25 @@ function Install-RealUptimeAgent {
   if (-not $Token) { throw "no token. Pass -Token rua_... (shown once when you register the agent in the dashboard)." }
   if ($Token -notlike "rua_*") { throw "that does not look like an agent token (expected rua_...)" }
 
-  $node = Get-Command node.exe -ErrorAction SilentlyContinue
-  if (-not $node) { throw "Node.js 22 or newer is required (https://nodejs.org)." }
-  $major = [int]((& node.exe -p "process.versions.node.split('.')[0]").Trim())
-  if ($major -lt 22) { throw "Node.js $major found; 22 or newer is required." }
+  if ($Build -ne "go") {
+    $node = Get-Command node.exe -ErrorAction SilentlyContinue
+    if (-not $node) { throw "Node.js 22 or newer is required (https://nodejs.org), or install the Go build with -Build go." }
+    $major = [int]((& node.exe -p "process.versions.node.split('.')[0]").Trim())
+    if ($major -lt 22) { throw "Node.js $major found; 22 or newer is required." }
+  }
 
   $tag = Resolve-ReleaseTag $Version
   $ver = $tag.Substring(6)
   $work = Join-Path $env:TEMP ("realuptime-agent-" + [guid]::NewGuid())
   New-Item -ItemType Directory -Path $work | Out-Null
-  $zip = Join-Path $work "realuptime-agent-$ver.zip"
-  Write-Host "downloading $tag"
-  Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$tag/realuptime-agent-$ver.zip" -OutFile $zip
+  $artifact = if ($Build -eq "go") { "realuptime-agent-go-$ver-windows-x64.exe" } else { "realuptime-agent-$ver.zip" }
+  $download = Join-Path $work $artifact
+  Write-Host "downloading $tag ($artifact)"
   Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$tag/SHA256SUMS" -OutFile (Join-Path $work "SHA256SUMS")
-
-  $expected = (Get-Content (Join-Path $work "SHA256SUMS") | Where-Object { $_ -match "realuptime-agent-$ver\.zip$" } | ForEach-Object { ($_ -split "\s+")[0] })
-  if (-not $expected) { throw "SHA256SUMS does not list realuptime-agent-$ver.zip" }
-  $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+  $expected = (Get-Content (Join-Path $work "SHA256SUMS") | Where-Object { $_ -match " $([regex]::Escape($artifact))$" } | ForEach-Object { ($_ -split "\s+")[0] })
+  if (-not $expected) { throw "SHA256SUMS does not list $artifact" }
+  Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseBase/$tag/$artifact" -OutFile $download
+  $actual = (Get-FileHash -Algorithm SHA256 $download).Hash.ToLower()
   if ($actual -ne $expected.ToLower()) { throw "checksum mismatch: refusing to install" }
   Write-Host "verified SHA256 checksum"
 
@@ -142,7 +150,11 @@ function Install-RealUptimeAgent {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   }
   New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-  Expand-Archive -Force -Path $zip -DestinationPath $InstallDir
+  if ($Build -eq "go") {
+    Copy-Item -Force -Path $download -Destination (Join-Path $InstallDir "realuptime-agent.exe")
+  } else {
+    Expand-Archive -Force -Path $download -DestinationPath $InstallDir
+  }
   Remove-Item -Recurse -Force $work
 
   # The environment for the agent, read by the launcher below. Administrators
@@ -169,14 +181,15 @@ function Install-RealUptimeAgent {
   # agent. Kept as a file in the install dir so the task's command line
   # carries no secret.
   $launcher = Join-Path $InstallDir "run-agent.ps1"
-  @'
-$ErrorActionPreference = "Stop"
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$envMap = Get-Content (Join-Path $here "env.json") -Raw | ConvertFrom-Json
-foreach ($p in $envMap.PSObject.Properties) { [Environment]::SetEnvironmentVariable($p.Name, $p.Value, "Process") }
-& node.exe (Join-Path $here "dist\agent.js")
-exit $LASTEXITCODE
-'@ | Set-Content -Path $launcher -Encoding UTF8
+  $run = if ($Build -eq "go") { '& (Join-Path $here "realuptime-agent.exe")' } else { '& node.exe (Join-Path $here "dist\agent.js")' }
+  @"
+`$ErrorActionPreference = "Stop"
+`$here = Split-Path -Parent `$MyInvocation.MyCommand.Path
+`$envMap = Get-Content (Join-Path `$here "env.json") -Raw | ConvertFrom-Json
+foreach (`$p in `$envMap.PSObject.Properties) { [Environment]::SetEnvironmentVariable(`$p.Name, `$p.Value, "Process") }
+$run
+exit `$LASTEXITCODE
+"@ | Set-Content -Path $launcher -Encoding UTF8
 
   $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$launcher`""
