@@ -9,7 +9,7 @@
  * pull request sets this, `package.json`'s `version` and agent-go's
  * `agentRelease` to each new version (release-please-config.json).
  */
-export const AGENT_VERSION = "0.4.1"; // x-release-please-version
+export const AGENT_VERSION = "0.5.3"; // x-release-please-version
 
 /**
  * What this build can do beyond the four probe verbs, declared on every poll
