@@ -3,7 +3,7 @@
 # Needs dpkg-deb (Debian/Ubuntu, or `brew install dpkg`). Packaging only:
 # the lead signs and publishes to the apt repository by hand (repo/README.md).
 #
-#   apps/agent/packaging/build-deb.sh
+#   agent/packaging/build-deb.sh
 #
 # The package depends on nodejs (>= 22), installs to /opt/realuptime-agent,
 # ships the systemd unit, creates the realuptime-agent system user in postinst

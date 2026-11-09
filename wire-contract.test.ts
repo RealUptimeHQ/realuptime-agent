@@ -56,6 +56,21 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
+/** A server source file these contract tests pin the agent against, read from
+ * REALUPTIME_SERVER_SRC: the server source tree (the gate fetches the
+ * files it needs). Unset, as in the public mirror or a bare local
+ * run, the test skips; set, the file must be there. ci/gate.sh sets it. */
+function serverFile(rel: string, ctx: { skip: () => void }): string {
+  const root = process.env.REALUPTIME_SERVER_SRC;
+  if (!root) {
+    ctx.skip();
+    return "";
+  }
+  const path = join(root, rel);
+  if (!existsSync(path)) throw new Error(`REALUPTIME_SERVER_SRC has no ${rel}`);
+  return path;
+}
+
 describe("wire contract", () => {
   it("names every field of a poll check", () => {
     const check: Required<AgentCheck> = {
@@ -653,9 +668,7 @@ describe("dependency hygiene", () => {
  */
 describe("json-path duplicate", () => {
   it("is byte-identical to packages/db/json-path.ts below the header", (ctx) => {
-    // Skips in the public mirror, where packages/db does not exist.
-    const fleetPath = join(HERE, "..", "..", "packages", "db", "json-path.ts");
-    if (!existsSync(fleetPath)) return ctx.skip();
+    const fleetPath = serverFile("packages/db/json-path.ts", ctx);
     const bodyOf = (source: string) => {
       const end = source.indexOf("*/");
       expect(end, "expected a leading block comment").toBeGreaterThan(-1);
@@ -673,10 +686,9 @@ describe("json-path duplicate", () => {
 // server stores. A rule added on one side only would either be refused whole
 // by the server's parser or never be counted.
 describe("egress rule names", () => {
-  it("match the server's list exactly", async () => {
+  it("match the server's list exactly", async (ctx) => {
     const { EGRESS_RULES } = await import("./egress-policy.ts");
-    const here = dirname(fileURLToPath(import.meta.url));
-    const server = readFileSync(join(here, "../../packages/db/monitor-agent-egress.ts"), "utf8");
+    const server = readFileSync(serverFile("packages/db/monitor-agent-egress.ts", ctx), "utf8");
     const start = server.indexOf("export const EGRESS_RULES = [");
     const block = server.slice(start, server.indexOf("] as const;", start));
     const serverRules = [...block.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]);
@@ -689,10 +701,9 @@ describe("egress rule names", () => {
 // accepts and the agent refuses is a monitor that fails on its first probe;
 // one the agent accepts and the server refuses is dead code. Both halves hold
 // literals rather than imports (this package imports nothing from the
-// server), so the text is pinned here. Skipped in the public mirror, where
-// packages/db does not exist.
+// server), so the text is pinned here.
 describe("secret reference rules", () => {
-  const serverPath = join(HERE, "../../packages/db/check-auth-rules.ts");
+  const serverRel = "packages/db/check-auth-rules.ts";
   const serverList = (source: string, name: string): string[] => {
     const start = source.indexOf(`export const ${name} = [`);
     expect(start, name).toBeGreaterThan(-1);
@@ -701,8 +712,7 @@ describe("secret reference rules", () => {
   };
 
   it("match the server's header lists, name pattern and capability", async (ctx) => {
-    if (!existsSync(serverPath)) ctx.skip();
-    const server = readFileSync(serverPath, "utf8");
+    const server = readFileSync(serverFile(serverRel, ctx), "utf8");
     const { BASE_AUTH_HEADER_NAMES, FORBIDDEN_AUTH_HEADER_NAMES, SECRET_NAME_PATTERN } = await import("./secrets.ts");
     const { AGENT_CAPABILITIES } = await import("./version.ts");
     expect(serverList(server, "BASE_AUTH_HEADER_NAMES")).toEqual([...BASE_AUTH_HEADER_NAMES]);
@@ -715,8 +725,7 @@ describe("secret reference rules", () => {
     // The server refuses secret references to any location reporting a
     // version below its minimum (0.3.0 shipped with no secret support). This
     // build declares the capability, so it has to clear that bar too.
-    if (!existsSync(serverPath)) ctx.skip();
-    const server = readFileSync(serverPath, "utf8");
+    const server = readFileSync(serverFile(serverRel, ctx), "utf8");
     const minimum = /export const SECRET_REFS_MIN_AGENT_VERSION = "(\d+)\.(\d+)\.(\d+)";/.exec(server);
     expect(minimum).not.toBeNull();
     const { AGENT_VERSION } = await import("./version.ts");
@@ -727,8 +736,7 @@ describe("secret reference rules", () => {
   });
 
   it("pins the auth block's bounds to the server's", async (ctx) => {
-    if (!existsSync(serverPath)) ctx.skip();
-    const server = readFileSync(serverPath, "utf8");
+    const server = readFileSync(serverFile(serverRel, ctx), "utf8");
     const { parseRules } = await import("./api.ts");
     expect(server).toContain(`export const MAX_AUTH_HEADERS = ${parseRules.maxAuthHeaders};`);
     expect(server).toContain(`export const MAX_AUTH_TEMPLATE_CHARS = ${parseRules.maxAuthTemplateChars};`);

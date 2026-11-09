@@ -4,9 +4,9 @@
 # GitHub release tagged `agent-<version>` by hand, the same operational shape
 # the official Docker image build documents.
 #
-#   apps/agent/packaging/build-release.sh [--sign]
+#   agent/packaging/build-release.sh [--sign]
 #
-# Output, in apps/agent/packaging/out/:
+# Output, in agent/packaging/out/:
 #   realuptime-agent-<ver>.tgz   dist/ + package.json, the thing install.sh
 #                                unpacks under /opt/realuptime-agent
 #   realuptime-agent-<ver>.zip   the same tree, for install-windows.ps1
@@ -16,7 +16,7 @@
 #                                on a host with neither Node.js nor Docker
 #   realuptime-agent-go-<ver>-{linux-x64,linux-arm64,darwin-x64,darwin-arm64,
 #                                windows-x64.exe}
-#                                the Go build (apps/agent-go), static, which
+#                                the Go build (agent-go), static, which
 #                                install.sh --build go and install-windows.ps1
 #                                -Build go install; built when Go is on PATH
 #   SHA256SUMS                  over the archives and the executables
@@ -61,7 +61,7 @@ REALUPTIME_AGENT_BINARY_TARGETS="linux-x64 linux-arm64" sh "$HERE/build-binary.s
 GO_BUILDS=""
 if command -v go >/dev/null 2>&1; then
   GO_OUT="$(mktemp -d)"
-  sh "$ROOT/apps/agent-go/packaging/build-release.sh" "$VERSION" "$GO_OUT"
+  sh "$ROOT/agent-go/packaging/build-release.sh" "$VERSION" "$GO_OUT"
   mv "$GO_OUT"/realuptime-agent-go-"$VERSION"-* "$OUT/"
   rm -rf "$GO_OUT"
   GO_BUILDS="$(cd "$OUT" && ls realuptime-agent-go-"$VERSION"-*)"

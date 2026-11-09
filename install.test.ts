@@ -17,22 +17,23 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 /**
- * The installers (REA-181) are served by the website from apps/web/public as
- * byte-identical copies of the files in apps/agent/install, the same
- * hand-kept-duplicate arrangement wire-contract.test.ts pins for json-path.ts.
- * Pinned here so an edit to one copy without the other fails before it
- * ships a different installer to `curl | sh` than the one reviewed in the
- * agent tree. A few structural properties of the scripts are pinned too:
- * the ones a customer's security reviewer would check first.
+ * The installers (REA-181) are served by the website from apps/web/public/agent
+ * in the server source tree as byte-identical copies of the files in
+ * agent/install, the same hand-kept-duplicate arrangement wire-contract.test.ts
+ * pins for json-path.ts. Pinned here, against REALUPTIME_SERVER_SRC (see
+ * wire-contract.test.ts), so an edit to one copy without the other fails
+ * before it ships a different installer to `curl | sh` than the one reviewed
+ * in the agent tree. A few structural properties of the scripts are pinned
+ * too: the ones a customer's security reviewer would check first.
  */
 const HERE = dirname(fileURLToPath(import.meta.url));
-const WEB_PUBLIC = join(HERE, "..", "web", "public", "agent");
+const SERVER_SRC = process.env.REALUPTIME_SERVER_SRC;
+const WEB_PUBLIC = SERVER_SRC ? join(SERVER_SRC, "apps", "web", "public", "agent") : "";
 
-// In the public mirror (scripts/publish-agent-mirror.mjs) the website tree
-// does not exist, so the byte-identity cross-checks against the served
-// copies have nothing to compare and skip; the structural pins below still
-// run everywhere.
-const IN_MONOREPO = existsSync(WEB_PUBLIC);
+// Without the website tree (the public mirror, a bare local run) the
+// byte-identity cross-checks have nothing to compare and skip; the
+// structural pins below still run everywhere.
+const IN_MONOREPO = Boolean(SERVER_SRC);
 
 describe("installers", () => {
   it.skipIf(!IN_MONOREPO)("the served Linux installer is byte-identical to the reviewed one", () => {
@@ -51,8 +52,8 @@ describe("installers", () => {
   // trustworthy as the checksum a customer can check before piping it into a
   // shell. install.sh.sha256 is checked in next to both copies of the
   // script, so an edit to install.sh without regenerating the checksum (run
-  // `sha256sum install.sh > install.sh.sha256` in apps/agent/install, then
-  // copy it to apps/web/public/agent) fails here instead of shipping a
+  // `sha256sum install.sh > install.sh.sha256` in agent/install, then
+  // copy it to apps/web/public/agent in the main repository) fails here instead of shipping a
   // published hash that no longer matches what curl actually fetches.
   it.skipIf(!IN_MONOREPO)("the published SHA256 for the Linux installer matches its actual contents, in both copies", () => {
     const script = readFileSync(join(HERE, "install", "install.sh"));
@@ -148,7 +149,7 @@ describe("installers", () => {
     const sh = readFileSync(join(HERE, "install", "install.sh"), "utf8");
     const pinned = /RELEASE_PUBKEY_PEM="([^"]+)"/.exec(sh)?.[1];
     expect(pinned).toContain("BEGIN PUBLIC KEY");
-    const served = join(HERE, "..", "web", "public", ".well-known", "cosign.pub");
+    const served = join(SERVER_SRC ?? "", "apps", "web", "public", ".well-known", "cosign.pub");
     if (IN_MONOREPO) expect(pinned).toBe(readFileSync(served, "utf8").trim());
   });
 

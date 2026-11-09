@@ -142,7 +142,7 @@ package, not improvised at publish time.
 ### The Go build (preview)
 
 Each release built with Go on the release machine also carries the same agent built in Go
-(`apps/agent-go`): one static executable per platform
+(`agent-go`): one static executable per platform
 (`realuptime-agent-go-<version>-linux-x64`, `-linux-arm64`, `-darwin-x64`,
 `-darwin-arm64`, `-windows-x64.exe`), listed in the same signed
 `SHA256SUMS`. It speaks the same API, runs the same checks and reports the

@@ -22,7 +22,7 @@ import type { HostInfo, MetricSample } from "./types.ts";
  * `/proc`, `/sys` and `/run` with filesystems statfs'd at their own mount
  * points. When the agent runs as a Kubernetes DaemonSet with the node's
  * root filesystem mounted read-only at `/host` (the manifest in
- * apps/agent/deploy/kubernetes), `/host/proc/stat` exists and every root
+ * agent/deploy/kubernetes), `/host/proc/stat` exists and every root
  * moves under `/host`: the readings are then the NODE's, and the vantage
  * is reported as `host` with detail `host-mount`, because that is what is
  * being measured. Nothing about this is configured; it is detected from

@@ -409,7 +409,7 @@ export type LogSnapshotSourceType = "journald" | "docker";
  * metrics flush -- never collected on every tick, never shipped with every
  * sample. See collect-logs.ts for the caps and the capture rule.
  *
- * Redaction is explicitly OUT of scope for phase 1 (see apps/agent/
+ * Redaction is explicitly OUT of scope for phase 1 (see agent/
  * README.md): a log line the operator's own application wrote may contain
  * a secret, and this snapshot ships it verbatim. The feature is opt-in per
  * source for exactly that reason. */

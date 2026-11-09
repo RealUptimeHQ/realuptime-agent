@@ -56,7 +56,7 @@ import type { LogSnapshot } from "./types.ts";
  * Redaction. A log line may contain a secret the operator's own application
  * wrote into it, and this module ships it verbatim once captured. That is
  * why every source is opt-in and off by default, and it is documented as
- * exactly that in apps/agent/README.md, with a redaction pass named as the
+ * exactly that in agent/README.md, with a redaction pass named as the
  * phase 2 gate before this feature is turned on by default anywhere.
  */
 

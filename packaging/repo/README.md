@@ -8,7 +8,7 @@ improvised at publish time.
 ## Artifacts
 
 `build-release.sh` -> `build-deb.sh` / `build-rpm.sh` leave in
-`apps/agent/packaging/out/`:
+`agent/packaging/out/`:
 
 - `realuptime-agent-<ver>.tgz`, `.zip`, `SHA256SUMS`, `SHA256SUMS.sig`
   (attached to the GitHub release `agent-<ver>`; what `install.sh` and

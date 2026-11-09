@@ -4,7 +4,7 @@
 # the lead signs (rpm --addsign) and publishes to the yum repository by hand
 # (repo/README.md).
 #
-#   apps/agent/packaging/build-rpm.sh
+#   agent/packaging/build-rpm.sh
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

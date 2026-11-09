@@ -7,9 +7,9 @@
 # publishes. build-release.sh calls this and lists the outputs in
 # SHA256SUMS beside the tarball.
 #
-#   apps/agent/packaging/build-binary.sh
+#   agent/packaging/build-binary.sh
 #
-# Output, in apps/agent/packaging/out/:
+# Output, in agent/packaging/out/:
 #   realuptime-agent-<ver>-linux-x64
 #   realuptime-agent-<ver>-linux-arm64
 #

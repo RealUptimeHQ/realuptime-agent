@@ -5,11 +5,11 @@
  *
  * Not read from `package.json`: this package has no JSON import today, and
  * `wire-contract.test.ts` pins its dependency list and import shape exactly
- * because a customer's security reviewer is expected to read it. Keep this
- * in sync with the `version` field in `package.json` by hand when either
- * changes.
+ * because a customer's security reviewer is expected to read it. The release
+ * pull request sets this, `package.json`'s `version` and agent-go's
+ * `agentRelease` to each new version (release-please-config.json).
  */
-export const AGENT_VERSION = "0.4.1";
+export const AGENT_VERSION = "0.4.1"; // x-release-please-version
 
 /**
  * What this build can do beyond the four probe verbs, declared on every poll

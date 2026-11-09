@@ -94,7 +94,7 @@ const defaultLookup: LookupFn = (hostname, options) =>
  *
  * There is no local API and no local database to put this in
  * (`docs/private-probe-locations.md` section 7 forbids both, and
- * `apps/agent/agent.ts` listening on no port is a load-bearing sentence), so
+ * `agent/agent.ts` listening on no port is a load-bearing sentence), so
  * the agent's health surface is its log stream. `runtime.ts` drains this once
  * a minute onto the poll line.
  */
