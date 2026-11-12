@@ -34,7 +34,7 @@ set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 AGENT="$(cd "$HERE/.." && pwd)"
-ROOT="$(cd "$AGENT/../.." && pwd)"
+ROOT="$(cd "$AGENT/.." && pwd)"
 OUT="$HERE/out"
 SIGN=0
 [ "${1:-}" = "--sign" ] && SIGN=1
