@@ -1,6 +1,6 @@
 {
   "name": "realuptime-agent",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "RealUptime Monitor agent: private-network checks and server health (CPU, memory, disk, containers, services) over outbound HTTPS only.",
   "license": "MIT",
   "repository": {
