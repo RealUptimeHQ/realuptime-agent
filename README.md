@@ -171,6 +171,13 @@ Run it under whatever supervisor you already use. The systemd unit the
 installer writes is `packaging/realuptime-agent.service`; the hardening
 directives in it are safe to keep. The agent writes nothing to disk.
 
+### Running the tests
+
+The test suite sits beside the code as `*.test.ts` files and needs Node.js 22
+or newer. In a checkout of this repository, `npm install` and then `npm test`
+run all of it; in the source workspace, `pnpm --filter @realuptime/agent test`
+runs the same suite. A change to the agent is expected to come with a test for it.
+
 ## Verify the image and the releases
 
 Published images are signed with cosign against a generated key pair, with an
