@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.5 (2026-11-14)
+
+
+### Bug Fixes
+
+* **agent:** a corrupt gzip body fails that one check, never the agent (REA-1155)
+
 ## 0.5.4 (2026-11-12)
 
 
