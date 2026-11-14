@@ -217,9 +217,18 @@ export async function runHttpCheck(
     let bodyText: string | null = null;
     let bodyTruncated = false;
     if (readBody) {
-      const result = await readAssertionBody(res, controller);
-      bodyText = result.text;
-      bodyTruncated = result.truncated;
+      try {
+        const result = await readAssertionBody(res, controller);
+        bodyText = result.text;
+        bodyTruncated = result.truncated;
+      } catch (err) {
+        // A body the target labelled compressed and then sent bytes that do
+        // not decode fails THIS check with a reason. Any other failure (a
+        // connection dropped mid-body) is left to reject as before.
+        const reason = bodyDecodeFailure(err, res.headers.get("content-encoding"));
+        if (reason === null) throw err;
+        return { ok: false, statusCode: status, latencyMs: Date.now() - started, error: reason };
+      }
     } else {
       void res.body?.cancel().catch(() => {});
     }
@@ -277,4 +286,35 @@ function describeFetchError(err: unknown): string {
       : undefined;
   const message = err instanceof Error ? err.message : String(err);
   return code ? `${message} (${code})` : message;
+}
+
+/** The content codings this agent decodes, as they are named in a reason. */
+const DECODED_CODINGS: Record<string, string> = { gzip: "gzip", "x-gzip": "gzip", deflate: "deflate", br: "br" };
+
+/**
+ * The reason for a body whose content coding would not decode, or null when
+ * `err` is not a decoding failure. zlib reports gzip and deflate failures as
+ * `Z_*` codes and brotli failures as `ERR__ERROR_*` codes, on the error itself
+ * (pinned-fetch.ts) or on its `cause` (fetch's "terminated"). The coding is
+ * named from the response header, never from the decoder's text, so the Go
+ * port (agent-go/check_http.go) reports the same words.
+ */
+export function bodyDecodeFailure(err: unknown, contentEncoding: string | null): string | null {
+  const codeOf = (e: unknown): string =>
+    e && typeof e === "object" && "code" in e ? String((e as { code: unknown }).code) : "";
+  const isDecodeCode = (code: string) => /^Z_/.test(code) || /^ERR__ERROR_/.test(code);
+  const cause = (err as { cause?: unknown } | null)?.cause;
+  if (!isDecodeCode(codeOf(err)) && !isDecodeCode(codeOf(cause))) return null;
+  return bodyDecodeReason(contentEncoding);
+}
+
+/** "Response body could not be decoded: corrupt <coding>", naming the
+ * outermost coding this agent decodes (the first one undone). */
+export function bodyDecodeReason(contentEncoding: string | null): string {
+  const codings = (contentEncoding ?? "")
+    .split(",")
+    .map((c) => DECODED_CODINGS[c.trim().toLowerCase()])
+    .filter((c): c is string => c !== undefined);
+  const outer = codings.at(-1);
+  return outer ? `Response body could not be decoded: corrupt ${outer}` : "Response body could not be decoded";
 }

@@ -331,3 +331,97 @@ describe("runHttpCheck: a hop that carries a credential", () => {
     expect(out.error).toContain("ECONNREFUSED");
   });
 });
+
+describe("runHttpCheck: a body that cannot be decoded (REA-1155)", () => {
+  // A target that labels its body `Content-Encoding: gzip` and then sends
+  // bytes that are not gzip, or a gzip stream cut short, fails that one check
+  // with a reason. It never rejects, and the next check still runs.
+  const REASON = "Response body could not be decoded: corrupt gzip";
+  const ASSERT = { assertionBodyOp: "contains", assertionBodyValue: "healthy" } as const;
+  const AUTH = { authorization: "Bearer resolved-on-this-machine" };
+  const pinTo127 = async () => ({ proceed: true, addresses: [{ address: "127.0.0.1", family: 4 as const }] });
+
+  async function corruptTargets() {
+    const { gzipSync } = await import("node:zlib");
+    const real = gzipSync(`${"padding ".repeat(4096)}status: healthy`);
+    const garbage = await serve((_req, res) => {
+      res.writeHead(200, { "content-encoding": "gzip" }).end("this is not gzip at all");
+    });
+    const truncated = await serve((_req, res) => {
+      res.writeHead(200, { "content-encoding": "gzip" }).end(real.subarray(0, real.length - 12));
+    });
+    const healthy = await serve((_req, res) => res.writeHead(200).end("status: healthy"));
+    return { garbage, truncated, healthy };
+  }
+
+  it("fails a garbage gzip body with the reason, and a later check still runs", async () => {
+    const { garbage, healthy } = await corruptTargets();
+    const out = await runHttpCheck(garbage, 2_000, undefined, ASSERT);
+    expect(out).toMatchObject({ ok: false, statusCode: 200, error: REASON });
+    expect(out.latencyMs).toBeGreaterThanOrEqual(0);
+    const next = await runHttpCheck(healthy, 2_000, undefined, ASSERT);
+    expect(next).toMatchObject({ ok: true, statusCode: 200 });
+  });
+
+  it("fails a garbage gzip body with the reason on a credentialed (pinned) hop", async () => {
+    const { garbage, healthy } = await corruptTargets();
+    const out = await runHttpCheck(
+      `http://pinned.invalid:${new URL(garbage).port}/`,
+      2_000,
+      undefined,
+      ASSERT,
+      pinTo127,
+      AUTH,
+    );
+    expect(out).toMatchObject({ ok: false, statusCode: 200, error: REASON });
+    const next = await runHttpCheck(`http://pinned.invalid:${new URL(healthy).port}/`, 2_000, undefined, ASSERT, pinTo127, AUTH);
+    expect(next).toMatchObject({ ok: true, statusCode: 200 });
+  });
+
+  it("fails a truncated gzip stream with the reason on a credentialed (pinned) hop", async () => {
+    const { truncated, healthy } = await corruptTargets();
+    const out = await runHttpCheck(
+      `http://pinned.invalid:${new URL(truncated).port}/`,
+      2_000,
+      undefined,
+      ASSERT,
+      pinTo127,
+      AUTH,
+    );
+    expect(out).toMatchObject({ ok: false, statusCode: 200, error: REASON });
+    const next = await runHttpCheck(healthy, 2_000, undefined, ASSERT);
+    expect(next).toMatchObject({ ok: true, statusCode: 200 });
+  });
+
+  it("never rejects on a truncated gzip stream over built-in fetch, and a later check still runs", async () => {
+    // undici's decoder hands over what it decoded and ends the body without
+    // an error on a missing gzip trailer, so the check is judged on the
+    // partial body (the assertion fails, the marker was cut off).
+    const { truncated, healthy } = await corruptTargets();
+    const out = await runHttpCheck(truncated, 2_000, undefined, ASSERT);
+    expect(out.ok).toBe(false);
+    expect(out.statusCode).toBe(200);
+    const next = await runHttpCheck(healthy, 2_000, undefined, ASSERT);
+    expect(next).toMatchObject({ ok: true, statusCode: 200 });
+  });
+
+  it("names the coding that failed: deflate and br too", async () => {
+    for (const coding of ["deflate", "br", "x-gzip"]) {
+      const url = await serve((_req, res) => {
+        res.writeHead(200, { "content-encoding": coding }).end("this is not compressed at all, not even a little");
+      });
+      const out = await runHttpCheck(url, 2_000, undefined, ASSERT);
+      const name = coding === "x-gzip" ? "gzip" : coding;
+      expect(out, coding).toMatchObject({ ok: false, statusCode: 200, error: `Response body could not be decoded: corrupt ${name}` });
+    }
+  });
+
+  it("still reports a connection dropped mid-body as it did before, not as a decode failure", async () => {
+    const url = await serve((_req, res) => {
+      res.writeHead(200, { "content-length": "100" });
+      res.write("only a little");
+      setTimeout(() => res.socket?.destroy(), 20);
+    });
+    await expect(runHttpCheck(url, 2_000, undefined, ASSERT)).rejects.toThrow("terminated");
+  });
+});
